@@ -288,8 +288,32 @@ def get_options_data():
     return option_trades, vol_surface
 
 
-trades, settles = get_data()
-contracts = sorted(trades["Contract"].unique())
+trades_all, settles_all = get_data()
+
+# --------------------------------------------------------------------------
+# As Of Date — lets the user view the book's state at any date between the
+# first trade and the latest available settlement, not just "today". Every
+# tab below reads from `trades`/`settles`, which are TRUNCATED to this date
+# (any trade or settlement after it is excluded), so FIFO positions,
+# realized P&L, VaR, and Greeks all recompute as of that point in time.
+# --------------------------------------------------------------------------
+min_as_of = trades_all["TradeDate"].min().date()
+max_as_of = settles_all["Date"].max().date()
+
+st.sidebar.markdown('<div class="term-panel-title">As of date</div>', unsafe_allow_html=True)
+as_of_selected = st.sidebar.date_input(
+    "Portfolio state as of", value=max_as_of, min_value=min_as_of, max_value=max_as_of,
+)
+as_of_date = pd.Timestamp(as_of_selected)
+is_latest = as_of_date.date() == max_as_of
+
+trades = trades_all[trades_all["TradeDate"] <= as_of_date].reset_index(drop=True)
+settles = settles_all[settles_all["Date"] <= as_of_date].reset_index(drop=True)
+
+if trades.empty:
+    st.sidebar.warning("No trades on or before this date yet.")
+
+contracts = sorted(trades["Contract"].unique()) if not trades.empty else sorted(trades_all["Contract"].unique())
 last_settle_by_contract = (
     settles.sort_values("Date").groupby("Contract")["SettlePrice"].last().to_dict()
 )
@@ -306,13 +330,13 @@ data_source = settles["Source"].iloc[0] if "Source" in settles.columns and len(s
 dot_class = "live" if data_source == "live" else "fallback"
 source_text = "LIVE — YAHOO FINANCE" if data_source == "live" else "STATIC FALLBACK — settlement_prices.csv"
 
-# AS OF = the actual date the settlement data (and therefore every P&L,
-# VaR, and Greek figure on this page) is calculated as of. This is NOT
-# the same as "now" -- distinguishing the two matters a lot here, since
-# in fallback mode this date can be meaningfully stale (see market_data.py
-# / greeks_engine.py notes on vol-surface and settlement staleness).
-as_of_date = settles["Date"].max()
-as_of_str = pd.Timestamp(as_of_date).strftime("%Y-%m-%d") if pd.notna(as_of_date) else "unknown"
+# The actual last settlement date on/before the selected As Of date --
+# can differ from as_of_date itself if that date falls on a weekend/
+# holiday with no settlement row.
+last_available_settle = settles["Date"].max() if len(settles) else None
+as_of_str = (
+    pd.Timestamp(last_available_settle).strftime("%Y-%m-%d") if pd.notna(last_available_settle) else "unknown"
+)
 now_str = dt.datetime.utcnow().strftime("%H:%M:%S UTC")
 
 st.markdown(
@@ -380,7 +404,14 @@ tab_portfolio, tab_risk, tab_greeks = st.tabs(["Portfolio Analysis", "Risk Metri
 # TAB 1 — Portfolio Analysis
 # ==========================================================================
 with tab_portfolio:
-    summary = book_summary(trades, settles, live_prices=live_prices)
+    if not is_latest:
+        st.info(
+            f"Viewing historical snapshot as of {as_of_date.strftime('%Y-%m-%d')} — "
+            "Live PnL is disabled here since the sidebar price override represents "
+            "'right now', not this date. Realized/Unrealized/Cumulative P&L below "
+            "reflect the book exactly as it stood on this date."
+        )
+    summary = book_summary(trades, settles, live_prices=live_prices if is_latest else None)
 
     total_realized = summary["RealizedPnL"].sum()
     total_unrealized = summary["UnrealizedPnL"].sum()
@@ -523,12 +554,16 @@ with tab_greeks:
     )
 
     try:
-        option_trades, vol_surface = get_options_data()
+        option_trades_all, vol_surface = get_options_data()
+        option_trades = option_trades_all[option_trades_all["TradeDate"] <= as_of_date].reset_index(drop=True)
     except FileNotFoundError as e:
         st.error(f"Options data not found: {e}")
         option_trades, vol_surface = None, None
 
     if option_trades is not None:
+        if not is_latest:
+            st.info(f"Viewing historical snapshot as of {as_of_date.strftime('%Y-%m-%d')}.")
+
         # Futures Delta, shown alongside for reference only (see note above)
         open_lots_fut, _ = compute_fifo_positions(trades)
         fut_positions = open_position_summary(open_lots_fut)
@@ -538,7 +573,7 @@ with tab_greeks:
         )
 
         _, realized_opt_df = compute_option_fifo_positions(option_trades)
-        live_greeks = compute_live_option_greeks(option_trades, settles, vol_surface)
+        live_greeks = compute_live_option_greeks(option_trades, settles, vol_surface, as_of_date=as_of_date)
         port_summary = portfolio_greeks_summary(live_greeks)
 
         total_realized_opt = realized_opt_df["RealizedPnL"].sum() if not realized_opt_df.empty else 0.0
