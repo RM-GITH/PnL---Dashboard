@@ -305,12 +305,22 @@ data_source = settles["Source"].iloc[0] if "Source" in settles.columns and len(s
 # --------------------------------------------------------------------------
 dot_class = "live" if data_source == "live" else "fallback"
 source_text = "LIVE — YAHOO FINANCE" if data_source == "live" else "STATIC FALLBACK — settlement_prices.csv"
+
+# AS OF = the actual date the settlement data (and therefore every P&L,
+# VaR, and Greek figure on this page) is calculated as of. This is NOT
+# the same as "now" -- distinguishing the two matters a lot here, since
+# in fallback mode this date can be meaningfully stale (see market_data.py
+# / greeks_engine.py notes on vol-surface and settlement staleness).
+as_of_date = settles["Date"].max()
+as_of_str = pd.Timestamp(as_of_date).strftime("%Y-%m-%d") if pd.notna(as_of_date) else "unknown"
 now_str = dt.datetime.utcnow().strftime("%H:%M:%S UTC")
+
 st.markdown(
     f"""
     <div class="term-status-bar">
-        <div><span class="dot {dot_class}"></span>BRENT CRUDE (BRN) BOOK &nbsp;·&nbsp; {source_text}</div>
-        <div>UPDATED {now_str}</div>
+        <div><span class="dot {dot_class}"></span>BRENT CRUDE (BRN) BOOK &nbsp;·&nbsp; {source_text}
+             &nbsp;·&nbsp; AS OF {as_of_str}</div>
+        <div>PAGE RENDERED {now_str}</div>
     </div>
     """,
     unsafe_allow_html=True,
