@@ -48,6 +48,7 @@ value payout) for any open lot whose ExpiryDate has passed.
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
+from scipy.optimize import brentq
 
 RISK_FREE_RATE_DEFAULT = 0.04  # flat 4%; swap for a real curve in production
 
@@ -56,8 +57,30 @@ RISK_FREE_RATE_DEFAULT = 0.04  # flat 4%; swap for a real curve in production
 # 1. Black-76 pricing & Greeks (pure functions, no I/O)
 # ==========================================================================
 
+def validate_black76_inputs(F: float, K: float, T: float, sigma: float, option_type: str) -> None:
+    """
+    Reject nonsensical inputs loudly instead of letting them flow through
+    silently as NaN/complex numbers (log(F/K) with F<=0, division by a
+    negative sigma, etc.). Commodities CAN go to zero or negative (WTI did,
+    April 2020) -- Black-76 has no valid answer for that regime, so raising
+    here is the honest response, not a full fix for that scenario (which
+    would need a different model entirely, e.g. Bachelier).
+    """
+    if F <= 0:
+        raise ValueError(f"Forward price F must be > 0, got {F}")
+    if K <= 0:
+        raise ValueError(f"Strike K must be > 0, got {K}")
+    if T < 0:
+        raise ValueError(f"Time to maturity T cannot be negative, got {T}")
+    if sigma < 0:
+        raise ValueError(f"Volatility sigma cannot be negative, got {sigma}")
+    if option_type.lower() not in ("call", "put"):
+        raise ValueError(f"option_type must be 'call' or 'put', got {option_type!r}")
+
+
 def black76_price(F: float, K: float, T: float, r: float, sigma: float, option_type: str = "call") -> float:
     """Black-76 price of a European option on a futures/forward F."""
+    validate_black76_inputs(F, K, T, sigma, option_type)
     option_type = option_type.lower()
     if T <= 0:
         intrinsic = max(F - K, 0.0) if option_type == "call" else max(K - F, 0.0)
@@ -83,9 +106,15 @@ def black76_greeks(F: float, K: float, T: float, r: float, sigma: float, option_
     between per-unit price math and position-level aggregation.
 
     Theta is returned PER DAY (divided by 365) since that's the usual way
-    desks read it; Vega is returned per 1.00 (100 vol points) change in
-    sigma -- divide by 100 yourself if you want "per vol point".
+    desks read it. Vega is returned per VOL POINT -- a 1 percentage-point
+    (0.01) change in sigma -- which is the conventional desk quoting
+    convention. The raw Black-76 formula gives sensitivity per 1.00 (a
+    100-point change in sigma), so it's divided by 100 here; this used to
+    be left to the caller to remember to do, which is exactly the kind of
+    silent unit mismatch that produces a number 100x too large with no
+    error anywhere -- so it's handled once, here, instead.
     """
+    validate_black76_inputs(F, K, T, sigma, option_type)
     option_type = option_type.lower()
     if T <= 0 or sigma <= 0:
         # Expired or degenerate -- no time value, Greeks collapse to the
@@ -106,7 +135,7 @@ def black76_greeks(F: float, K: float, T: float, r: float, sigma: float, option_
         delta = discount * (norm.cdf(d1) - 1)
 
     gamma = discount * norm.pdf(d1) / (F * sigma * np.sqrt(T))
-    vega = discount * F * np.sqrt(T) * norm.pdf(d1)
+    vega = discount * F * np.sqrt(T) * norm.pdf(d1) / 100.0  # per vol point, not per 100 vol points -- see docstring
 
     if option_type == "call":
         theta_annual = (-discount * F * norm.pdf(d1) * sigma / (2 * np.sqrt(T))
@@ -120,6 +149,26 @@ def black76_greeks(F: float, K: float, T: float, r: float, sigma: float, option_
     return {"Delta": delta, "Gamma": gamma, "Vega": vega, "Theta": theta_annual / 365.0, "Rho": rho}
 
 
+def implied_vol(market_price: float, F: float, K: float, T: float, r: float, option_type: str = "call",
+                 vol_bracket: tuple = (1e-6, 5.0)) -> float:
+    """
+    Back out the implied vol that reprices `market_price` exactly, via
+    Brent's method (scipy.optimize.brentq) bisecting on black76_price's
+    monotonic relationship between sigma and price.
+
+    Not currently wired into the live Greeks pipeline (which uses the
+    vol SURFACE, not back-solved vol) -- this is a standalone utility,
+    useful for e.g. checking what vol the book's own traded Premium
+    implies, as a sanity check against the surface used for valuation.
+    Raises (from brentq) if no root exists in `vol_bracket` -- e.g. if
+    `market_price` is below intrinsic value or implausibly high.
+    """
+    def objective(vol):
+        return black76_price(F, K, T, r, vol, option_type) - market_price
+
+    return brentq(objective, vol_bracket[0], vol_bracket[1])
+
+
 # ==========================================================================
 # 2. Loading data
 # ==========================================================================
@@ -129,7 +178,20 @@ def load_option_trades(path: str) -> pd.DataFrame:
     df = pd.read_excel(path, sheet_name="OptionTrades")
     df["TradeDate"] = pd.to_datetime(df["TradeDate"])
     df["ExpiryDate"] = pd.to_datetime(df["ExpiryDate"])
-    df["SignedQty"] = np.where(df["BuySell"].str.upper() == "BUY", df["Quantity"], -df["Quantity"])
+
+    # Same validation as pnl_engine.load_trades(), and for the same reason:
+    # silently coercing anything non-"BUY" to SELL would flip a trade's
+    # direction with no error. See pnl_engine.py for the full rationale.
+    buy_sell_clean = df["BuySell"].astype(str).str.upper()
+    invalid = ~buy_sell_clean.isin(["BUY", "SELL"])
+    if invalid.any():
+        bad = df.loc[invalid, [c for c in ["TradeID", "BuySell"] if c in df.columns]]
+        raise ValueError(
+            "Invalid BuySell value(s) -- must be exactly 'BUY' or 'SELL' "
+            f"(case-insensitive, no extra whitespace):\n{bad.to_string(index=False)}"
+        )
+
+    df["SignedQty"] = np.where(buy_sell_clean == "BUY", df["Quantity"], -df["Quantity"])
     return df.sort_values("TradeDate").reset_index(drop=True)
 
 
@@ -208,8 +270,11 @@ def open_option_position_summary(open_lots: dict) -> pd.DataFrame:
 # 4. Volatility surface lookup
 # ==========================================================================
 
+VOL_SURFACE_STALENESS_WARNING_DAYS = 5  # flag (not block) a vol lookup this far from as_of_date
+
+
 def lookup_implied_vol(vol_surface: pd.DataFrame, underlying: str, expiry: pd.Timestamp,
-                        strike: float, as_of_date: pd.Timestamp) -> float:
+                        strike: float, as_of_date: pd.Timestamp):
     """
     Nearest-date, nearest-expiry, strike-interpolated vol lookup.
 
@@ -221,6 +286,16 @@ def lookup_implied_vol(vol_surface: pd.DataFrame, underlying: str, expiry: pd.Ti
       richer surface with multiple tenors per underlying work unchanged).
     - Strike: linearly interpolated across that day's strike grid
       (np.interp also handles extrapolation by clamping to the grid ends).
+
+    Returns (implied_vol, date_staleness_days). The staleness figure is
+    the gap, in calendar days, between as_of_date and the nearest surface
+    date actually used -- previously this gap was computed internally and
+    then silently discarded, so a caller running in live mode past the
+    dummy surface's last available date (which this project has already
+    done, in practice) would get a vol with zero indication it was stale.
+    Callers are expected to check this, not just use the vol blindly --
+    see VOL_SURFACE_STALENESS_WARNING_DAYS and compute_live_option_greeks's
+    "VolStalenessDays" column.
     """
     sub = vol_surface[vol_surface["UnderlyingContract"] == underlying]
     if sub.empty:
@@ -232,7 +307,9 @@ def lookup_implied_vol(vol_surface: pd.DataFrame, underlying: str, expiry: pd.Ti
     nearest_date = min(sub["Date"].unique(), key=lambda d: abs((pd.Timestamp(d) - as_of_date).days))
     day_slice = sub[sub["Date"] == nearest_date].sort_values("Strike")
 
-    return float(np.interp(strike, day_slice["Strike"].values, day_slice["ImpliedVol"].values))
+    vol = float(np.interp(strike, day_slice["Strike"].values, day_slice["ImpliedVol"].values))
+    date_staleness_days = abs((pd.Timestamp(nearest_date) - as_of_date).days)
+    return vol, date_staleness_days
 
 
 # ==========================================================================
@@ -277,7 +354,9 @@ def compute_live_option_greeks(option_trades: pd.DataFrame, settles: pd.DataFram
         if F is None:
             continue
         T = days_to_expiry / 365.0
-        sigma = lookup_implied_vol(vol_surface, pos.UnderlyingContract, pos.ExpiryDate, pos.Strike, as_of_date)
+        sigma, vol_staleness_days = lookup_implied_vol(
+            vol_surface, pos.UnderlyingContract, pos.ExpiryDate, pos.Strike, as_of_date
+        )
         lot_size = lot_size_by_underlying.get(pos.UnderlyingContract, 1000)
 
         price = black76_price(F, pos.Strike, T, r, sigma, pos.OptionType)
@@ -288,7 +367,7 @@ def compute_live_option_greeks(option_trades: pd.DataFrame, settles: pd.DataFram
             "UnderlyingContract": pos.UnderlyingContract, "OptionType": pos.OptionType,
             "Strike": pos.Strike, "ExpiryDate": pos.ExpiryDate, "DaysToExpiry": days_to_expiry,
             "NetQty": pos.NetQty, "AvgEntryPremium": pos.AvgEntryPremium,
-            "Forward": F, "ImpliedVol": sigma, "TheoPrice": price,
+            "Forward": F, "ImpliedVol": sigma, "VolStalenessDays": vol_staleness_days, "TheoPrice": price,
             "Delta": greeks["Delta"], "Gamma": greeks["Gamma"], "Vega": greeks["Vega"],
             "Theta": greeks["Theta"], "Rho": greeks["Rho"],
             "PositionDelta": scale * greeks["Delta"], "PositionGamma": scale * greeks["Gamma"],
