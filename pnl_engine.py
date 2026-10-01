@@ -57,9 +57,25 @@ def load_trades(path: str) -> pd.DataFrame:
     """Read the trade blotter (Excel) and normalize dtypes/sign convention."""
     df = pd.read_excel(path, sheet_name="Trades")
     df["TradeDate"] = pd.to_datetime(df["TradeDate"])
+
+    # Validate BuySell BEFORE using it to set sign. The old code did
+    # `np.where(BuySell.str.upper() == "BUY", Quantity, -Quantity)`, which
+    # silently treats ANYTHING that isn't exactly "BUY" as a SELL -- a typo,
+    # a trailing space, "BUYY" -- flipping that trade's direction with no
+    # error, corrupting every downstream number (realized P&L, MTM,
+    # position). Fail loudly instead.
+    buy_sell_clean = df["BuySell"].astype(str).str.upper()
+    invalid = ~buy_sell_clean.isin(["BUY", "SELL"])
+    if invalid.any():
+        bad = df.loc[invalid, [c for c in ["TradeID", "BuySell"] if c in df.columns]]
+        raise ValueError(
+            "Invalid BuySell value(s) -- must be exactly 'BUY' or 'SELL' "
+            f"(case-insensitive, no extra whitespace):\n{bad.to_string(index=False)}"
+        )
+
     # SignedQty > 0 for a BUY (long), < 0 for a SELL (short). Using a signed
     # quantity once here means every formula downstream is direction-agnostic.
-    df["SignedQty"] = np.where(df["BuySell"].str.upper() == "BUY", df["Quantity"], -df["Quantity"])
+    df["SignedQty"] = np.where(buy_sell_clean == "BUY", df["Quantity"], -df["Quantity"])
     return df.sort_values("TradeDate").reset_index(drop=True)
 
 
@@ -166,6 +182,24 @@ def compute_daily_mtm(trades: pd.DataFrame, settles: pd.DataFrame) -> pd.DataFra
         cprices = settles[settles["Contract"] == contract].sort_values("Date")
         lot_size = ctrades["LotSize"].iloc[0]
 
+        # The loop below is driven by SETTLEMENT dates, not trade dates --
+        # so a trade whose date has no matching settlement row for this
+        # contract would otherwise be silently skipped entirely: it would
+        # never contribute to trade_pnl or update `position`, with no
+        # error or warning anywhere. Fail loudly instead, same philosophy
+        # as the BUY/SELL validation in load_trades().
+        settle_dates = set(cprices["Date"])
+        trade_dates = set(ctrades["TradeDate"])
+        missing_dates = trade_dates - settle_dates
+        if missing_dates:
+            bad_trades = ctrades[ctrades["TradeDate"].isin(missing_dates)][["TradeID", "TradeDate"]]
+            raise ValueError(
+                f"{contract}: {len(missing_dates)} trade date(s) have no matching settlement price "
+                f"row and would be silently dropped from the MTM calculation:\n"
+                f"{bad_trades.to_string(index=False)}\n"
+                "Add a settlement price for these dates, or correct the trade date."
+            )
+
         position = 0.0
         prev_settle = None
         cum_pnl = 0.0
@@ -270,33 +304,11 @@ def compute_live_pnl(trades: pd.DataFrame, live_prices: dict) -> pd.DataFrame:
 # ==========================================================================
 
 def book_summary(trades: pd.DataFrame, settles: pd.DataFrame,
-                  live_prices: dict = None, as_of=None) -> pd.DataFrame:
+                  live_prices: dict = None) -> pd.DataFrame:
     """
     One row per contract: net position, avg entry, realized PnL to date,
     unrealized PnL at last settle, and (if live_prices given) live PnL.
-
-    as_of : optional date (str or pd.Timestamp). If given, the book is
-            valued as of that date: only trades on or before `as_of` count
-            towards position/realized PnL, and "SettlePrice" is the most
-            recent settlement price on or before `as_of` (not necessarily
-            the very latest one in `settles`). Leave as None to use every
-            trade and the latest available settlement, as before.
     """
-    if as_of is not None:
-        as_of = pd.Timestamp(as_of)
-        trades = trades[trades["TradeDate"] <= as_of]
-        settles = settles[settles["Date"] <= as_of]
-
-    if trades.empty:
-        # Nothing had traded yet as of this date -- return an empty, but
-        # correctly-shaped, summary rather than letting the merges below
-        # raise a confusing KeyError.
-        cols = ["Contract", "Position", "AvgEntryPrice", "SettlePrice", "RealizedPnL",
-                "UnrealizedPnL", "CumulativePnL"]
-        if live_prices:
-            cols += ["LivePrice", "LivePnL"]
-        return pd.DataFrame(columns=cols)
-
     open_lots, realized_df = compute_fifo_positions(trades)
     positions = open_position_summary(open_lots)
 
