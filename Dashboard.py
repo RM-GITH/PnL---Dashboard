@@ -51,6 +51,7 @@ from greeks_engine import (
     black76_greeks,
     lookup_implied_vol,
     RISK_FREE_RATE_DEFAULT,
+    VOL_SURFACE_STALENESS_WARNING_DAYS,
 )
 
 st.set_page_config(page_title="Brent Futures Book — PnL & Risk", layout="wide")
@@ -576,6 +577,16 @@ with tab_greeks:
         live_greeks = compute_live_option_greeks(option_trades, settles, vol_surface, as_of_date=as_of_date)
         port_summary = portfolio_greeks_summary(live_greeks)
 
+        if not live_greeks.empty and live_greeks["VolStalenessDays"].max() > VOL_SURFACE_STALENESS_WARNING_DAYS:
+            worst = live_greeks.loc[live_greeks["VolStalenessDays"].idxmax()]
+            st.warning(
+                f"Volatility surface data is stale for one or more open positions — up to "
+                f"{int(live_greeks['VolStalenessDays'].max())} days away from the selected as-of date "
+                f"(worst case: {worst.UnderlyingContract} {worst.OptionType} {worst.Strike:.2f}). "
+                "Greeks below are still computed, but with the nearest available vol, not a current one. "
+                "See 'VolStalenessDays' in the table below for the per-position detail."
+            )
+
         total_realized_opt = realized_opt_df["RealizedPnL"].sum() if not realized_opt_df.empty else 0.0
         total_position_delta_opt = live_greeks["PositionDelta"].sum() if not live_greeks.empty else 0.0
 
@@ -648,7 +659,14 @@ with tab_greeks:
         else:
             T = days_to_expiry / 365.0
             strike_grid = np.linspace(F * 0.85, F * 1.15, 60)
-            sigmas = [lookup_implied_vol(vol_surface, sel_underlying, expiry, k, as_of) for k in strike_grid]
+            vol_lookups = [lookup_implied_vol(vol_surface, sel_underlying, expiry, k, as_of) for k in strike_grid]
+            sigmas = [v for v, _ in vol_lookups]
+            chart_staleness = max(s for _, s in vol_lookups)
+            if chart_staleness > VOL_SURFACE_STALENESS_WARNING_DAYS:
+                st.warning(
+                    f"This chart's vol surface lookup is {chart_staleness} days from the selected as-of "
+                    "date — the smile shown may not reflect current conditions."
+                )
             greek_curves = {g: [] for g in ["Delta", "Gamma", "Vega", "Theta"]}
             for k, sigma in zip(strike_grid, sigmas):
                 g = black76_greeks(F, k, T, RISK_FREE_RATE_DEFAULT, sigma, sel_type)
