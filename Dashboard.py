@@ -267,9 +267,16 @@ def style_risk_table(df: pd.DataFrame, magnitude_cols: list) -> "pd.io.formats.s
 # ==========================================================================
 # Data loading (cached so it doesn't re-fetch/re-read on every interaction)
 # ==========================================================================
+# NOTE on file naming: the dashboard reads trades.xlsx / options_trades.xlsx --
+# these are the REAL, user-maintained blotters (edit them in Excel, commit,
+# push). They are intentionally separate from trades_dummy.xlsx /
+# options_trades_dummy.xlsx, which are generate_dummy_data.py's sandbox
+# output -- re-running that script regenerates the _dummy files only and
+# will never touch your real trades.xlsx / options_trades.xlsx. See
+# README.md for the full workflow.
 @st.cache_data(ttl=900)  # 15 min: fresh enough to pick up a live price, gentle enough on Yahoo
 def get_data():
-    trades = load_trades("trades_dummy.xlsx")
+    trades = load_trades("trades.xlsx")
     contracts = sorted(trades["Contract"].unique())
     start_date = trades["TradeDate"].min()
 
@@ -284,7 +291,7 @@ def get_data():
 
 @st.cache_data(ttl=900)
 def get_options_data():
-    option_trades = load_option_trades("options_trades_dummy.xlsx")
+    option_trades = load_option_trades("options_trades.xlsx")
     vol_surface = load_volatility_surface("volatility_surface_dummy.csv")
     return option_trades, vol_surface
 
