@@ -322,6 +322,34 @@ def open_option_position_summary(open_lots: dict) -> pd.DataFrame:
 VOL_SURFACE_STALENESS_WARNING_DAYS = 5  # flag (not block) a vol lookup this far from as_of_date
 
 
+def get_vol_surface_slice(vol_surface: pd.DataFrame, underlying: str, expiry: pd.Timestamp,
+                           as_of_date: pd.Timestamp):
+    """
+    Resolves `underlying` (exact match or commodity fallback, see
+    resolve_surface_underlying), finds the nearest ExpiryDate and nearest
+    Date on the surface, and returns the resulting (Strike, ImpliedVol)
+    slice -- the actual real data points available to interpolate from.
+
+    Returns (day_slice, date_staleness_days). day_slice has columns
+    Strike, ImpliedVol, sorted by Strike. Callers doing a SWEEP across
+    many strikes (e.g. a Greeks-vs-Strike chart) should call this ONCE
+    and reuse the slice, rather than calling lookup_implied_vol in a loop
+    and silently re-resolving/re-filtering the same slice on every single
+    query point.
+    """
+    resolved = resolve_surface_underlying(vol_surface, underlying)
+    sub = vol_surface[vol_surface["UnderlyingContract"] == resolved]
+
+    nearest_expiry = min(sub["ExpiryDate"].unique(), key=lambda e: abs((pd.Timestamp(e) - expiry).days))
+    sub = sub[sub["ExpiryDate"] == nearest_expiry]
+
+    nearest_date = min(sub["Date"].unique(), key=lambda d: abs((pd.Timestamp(d) - as_of_date).days))
+    day_slice = sub[sub["Date"] == nearest_date].sort_values("Strike")
+
+    date_staleness_days = abs((pd.Timestamp(nearest_date) - as_of_date).days)
+    return day_slice[["Strike", "ImpliedVol"]].reset_index(drop=True), date_staleness_days
+
+
 def lookup_implied_vol(vol_surface: pd.DataFrame, underlying: str, expiry: pd.Timestamp,
                         strike: float, as_of_date: pd.Timestamp):
     """
@@ -346,16 +374,22 @@ def lookup_implied_vol(vol_surface: pd.DataFrame, underlying: str, expiry: pd.Ti
     see VOL_SURFACE_STALENESS_WARNING_DAYS and compute_live_option_greeks's
     "VolStalenessDays" column.
     """
-    sub = vol_surface[vol_surface["UnderlyingContract"] == resolve_surface_underlying(vol_surface, underlying)]
+    day_slice, date_staleness_days = get_vol_surface_slice(vol_surface, underlying, expiry, as_of_date)
 
-    nearest_expiry = min(sub["ExpiryDate"].unique(), key=lambda e: abs((pd.Timestamp(e) - expiry).days))
-    sub = sub[sub["ExpiryDate"] == nearest_expiry]
-
-    nearest_date = min(sub["Date"].unique(), key=lambda d: abs((pd.Timestamp(d) - as_of_date).days))
-    day_slice = sub[sub["Date"] == nearest_date].sort_values("Strike")
+    if day_slice["Strike"].nunique() < 2:
+        # np.interp against a single point doesn't fail -- it silently
+        # returns that one constant value for EVERY query strike, with no
+        # indication it isn't real interpolation. A real bug traced back
+        # to exactly this: thin live market coverage left only one strike
+        # surviving no-extrapolation filtering at a given maturity, and a
+        # strike sweep across it rendered as a perfectly flat "smile" with
+        # no error anywhere. Fail loudly instead.
+        raise ValueError(
+            f"Only {day_slice['Strike'].nunique()} distinct strike(s) available for '{underlying}' at the "
+            "nearest matching expiry/date -- not enough real coverage to interpolate a smile from."
+        )
 
     vol = float(np.interp(strike, day_slice["Strike"].values, day_slice["ImpliedVol"].values))
-    date_staleness_days = abs((pd.Timestamp(nearest_date) - as_of_date).days)
     return vol, date_staleness_days
 
 
@@ -504,4 +538,3 @@ if __name__ == "__main__":
 
     except FileNotFoundError as e:
         print(f"\n(Skipping full pipeline test -- data file not found: {e})")
-    
