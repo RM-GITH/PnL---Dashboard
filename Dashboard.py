@@ -21,6 +21,7 @@ decoration. See TERMINAL_CSS below for the token system.
 """
 
 import datetime as dt
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -36,6 +37,7 @@ from pnl_engine import (
     open_position_summary,
 )
 from market_data import get_settlement_prices
+from market_vol_surface import build_market_vol_surface
 from risk_engine import (
     build_risk_inputs_from_book,
     compute_historical_var_es,
@@ -289,10 +291,57 @@ def get_data():
     )
     return trades, settles
 
+@st.cache_data(ttl=86400)  # once daily: a vol surface build makes ~30-40 option-chain calls to Yahoo, and doesn't need refreshing more often than that
+def get_market_vol_surface():
+    """
+    Tries to build a REAL market-calibrated vol surface from BNO (Brent
+    proxy) and USO (WTI proxy) listed options -- see market_vol_surface.py
+    for the full method. Falls back to the static dummy surface if the
+    live build fails for ANY reason (no network, no liquid expiries,
+    yfinance error) -- never raises, same philosophy as
+    get_settlement_prices() in market_data.py.
+    """
+    surfaces = []
+    live_built = set()
+    for ticker, commodity in (("BNO", "BRENT"), ("USO", "WTI")):
+        try:
+            s = build_market_vol_surface(ticker, commodity)
+            if s.empty:
+                raise RuntimeError("zero usable points after filtering/interpolation")
+            s["Source"] = "market"
+            surfaces.append(s)
+            live_built.add(commodity)
+        except Exception as e:
+            # Independent per-commodity failure: a BNO (Brent) failure
+            # must not discard a successful USO (WTI) fetch, or vice versa.
+            warnings.warn(f"Live market vol surface build failed for {commodity} ({ticker}): {e}", RuntimeWarning)
+
+    if "BRENT" not in live_built:
+        # The dummy data only ever covered Brent (BRN Sep26/Oct26/Dec26) --
+        # it's a real, honest fallback here. Keep it in its original
+        # contract-month naming; the options book's positions ARE named
+        # "BRN Sep26" etc., so this matches directly with no relabeling.
+        warnings.warn("Falling back to volatility_surface_dummy.csv for BRENT.", RuntimeWarning)
+        dummy = load_volatility_surface("volatility_surface_dummy.csv")
+        dummy["Source"] = "dummy_fallback"
+        surfaces.append(dummy)
+    if "WTI" not in live_built:
+        # No dummy WTI data exists to fall back to -- there are currently
+        # no WTI positions in the options book, so this is silent-safe
+        # today, but would surface as a clear lookup error the moment a
+        # WTI option trade is actually added without live data available.
+        warnings.warn("No live WTI vol surface available, and no dummy WTI fallback exists.", RuntimeWarning)
+
+    if not surfaces:
+        raise RuntimeError("No volatility surface data available at all (live fetch failed, no fallback exists).")
+
+    return pd.concat(surfaces, ignore_index=True)
+
+
 @st.cache_data(ttl=900)
 def get_options_data():
     option_trades = load_option_trades("options_trades.xlsx")
-    vol_surface = load_volatility_surface("volatility_surface_dummy.csv")
+    vol_surface = get_market_vol_surface()
     return option_trades, vol_surface
 
 
@@ -569,6 +618,18 @@ with tab_greeks:
         option_trades, vol_surface = None, None
 
     if option_trades is not None:
+        if "Source" in vol_surface.columns and len(vol_surface):
+            lines = []
+            for underlying, grp in vol_surface.groupby("UnderlyingContract"):
+                source = grp["Source"].iloc[0]
+                coverage = f"{grp['ExpiryDate'].min().strftime('%Y-%m')} to {grp['ExpiryDate'].max().strftime('%Y-%m')}"
+                dot = "🟢" if source == "market" else "🟡"
+                label = "LIVE market-calibrated" if source == "market" else "STATIC fallback"
+                lines.append(f"{dot} {underlying}: {label} ({coverage})")
+            st.caption("Vol surface — " + " · ".join(lines))
+        else:
+            st.caption("🟡 Vol surface: STATIC fallback (volatility_surface_dummy.csv)")
+
         if not is_latest:
             st.info(f"Viewing historical snapshot as of {as_of_date.strftime('%Y-%m-%d')}.")
 
