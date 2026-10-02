@@ -52,6 +52,7 @@ from greeks_engine import (
     portfolio_greeks_summary,
     black76_greeks,
     lookup_implied_vol,
+    resolve_surface_underlying,
     RISK_FREE_RATE_DEFAULT,
     VOL_SURFACE_STALENESS_WARNING_DAYS,
 )
@@ -745,10 +746,19 @@ with tab_greeks:
 
         as_of = settles["Date"].max()
         F = last_settle_by_contract[sel_underlying]
-        expiry = vol_surface.loc[vol_surface["UnderlyingContract"] == sel_underlying, "ExpiryDate"].iloc[0]
-        days_to_expiry = (expiry - as_of).days
+        try:
+            resolved_underlying = resolve_surface_underlying(vol_surface, sel_underlying)
+            expiry = vol_surface.loc[vol_surface["UnderlyingContract"] == resolved_underlying, "ExpiryDate"].iloc[0]
+            days_to_expiry = (expiry - as_of).days
+            vol_data_available = True
+        except (ValueError, IndexError) as e:
+            st.warning(f"No volatility surface data available for {sel_underlying}: {e}")
+            vol_data_available = False
+            days_to_expiry = 0
 
-        if days_to_expiry <= 0:
+        if not vol_data_available:
+            pass  # warning already shown above
+        elif days_to_expiry <= 0:
             st.warning(f"{sel_underlying}'s option expiry has passed the latest settlement date — nothing to plot.")
         else:
             T = days_to_expiry / 365.0
