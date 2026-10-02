@@ -46,7 +46,6 @@ from risk_engine import (
 )
 from greeks_engine import (
     load_option_trades,
-    load_volatility_surface,
     compute_option_fifo_positions,
     compute_live_option_greeks,
     portfolio_greeks_summary,
@@ -341,24 +340,18 @@ def get_market_vol_surface():
             # must not discard a successful USO (WTI) fetch, or vice versa.
             warnings.warn(f"Live market vol surface build failed for {commodity} ({ticker}): {e}", RuntimeWarning)
 
+    # NO dummy fallback for either commodity, by design: a silent synthetic
+    # substitute is worse than a clear "no data" state, because it's
+    # indistinguishable from real data in the UI unless someone checks the
+    # Source column specifically. If live data isn't available, say so
+    # plainly and show nothing, rather than quietly drawing a fake smile.
     if "BRENT" not in live_built:
-        # The dummy data only ever covered Brent (BRN Sep26/Oct26/Dec26) --
-        # it's a real, honest fallback here. Keep it in its original
-        # contract-month naming; the options book's positions ARE named
-        # "BRN Sep26" etc., so this matches directly with no relabeling.
-        warnings.warn("Falling back to volatility_surface_dummy.csv for BRENT.", RuntimeWarning)
-        dummy = load_volatility_surface("volatility_surface_dummy.csv")
-        dummy["Source"] = "dummy_fallback"
-        surfaces.append(dummy)
+        warnings.warn("No live BRENT vol surface available. No fallback is used.", RuntimeWarning)
     if "WTI" not in live_built:
-        # No dummy WTI data exists to fall back to -- there are currently
-        # no WTI positions in the options book, so this is silent-safe
-        # today, but would surface as a clear lookup error the moment a
-        # WTI option trade is actually added without live data available.
-        warnings.warn("No live WTI vol surface available, and no dummy WTI fallback exists.", RuntimeWarning)
+        warnings.warn("No live WTI vol surface available. No fallback is used.", RuntimeWarning)
 
     if not surfaces:
-        raise RuntimeError("No volatility surface data available at all (live fetch failed, no fallback exists).")
+        raise RuntimeError("No volatility surface data available at all (live fetch failed for both commodities, no fallback is used).")
 
     return pd.concat(surfaces, ignore_index=True)
 
@@ -643,6 +636,12 @@ with tab_greeks:
     except FileNotFoundError as e:
         st.error(f"Options data not found: {e}")
         option_trades, vol_surface = None, None
+    except RuntimeError as e:
+        # No dummy fallback is used for the vol surface (by design) -- this
+        # is the expected failure mode when live fetch fails for BOTH
+        # commodities (no network, Yahoo outage, etc.), not a bug.
+        st.error(f"No volatility surface data available: {e}")
+        option_trades, vol_surface = None, None
 
     if option_trades is not None:
         if "Source" in vol_surface.columns and len(vol_surface):
@@ -785,32 +784,63 @@ with tab_greeks:
                     )
 
                 T = days_to_expiry / 365.0
-                strike_grid = np.linspace(F * 0.85, F * 1.15, 60)
-                sigmas = np.interp(strike_grid, day_slice["Strike"].values, day_slice["ImpliedVol"].values)
 
-                greek_curves = {g: [] for g in ["Delta", "Gamma", "Vega", "Theta"]}
-                for k, sigma in zip(strike_grid, sigmas):
-                    g = black76_greeks(F, k, T, RISK_FREE_RATE_DEFAULT, sigma, sel_type)
-                    for name in greek_curves:
-                        greek_curves[name].append(g[name])
+                # Restrict the sweep to the INTERSECTION of the intended
+                # window (F*0.85-F*1.15) and the real data's actual strike
+                # range. Sweeping the full intended window regardless of
+                # real coverage was a second, more subtle form of the same
+                # bug already fixed once (single-point collapse): np.interp
+                # doesn't extrapolate a trend outside the real range, but it
+                # DOES clamp to the boundary value -- which, if the real
+                # range is much narrower than the intended window (thin
+                # liquidity, e.g. BNO), can make MOST of a wide sweep
+                # render as a flat clamped line even with several genuine
+                # real points feeding it. Clamping is extrapolation by
+                # another name, and this project doesn't do that anywhere
+                # else -- the chart shouldn't either.
+                intended_min, intended_max = F * 0.85, F * 1.15
+                real_min, real_max = day_slice["Strike"].min(), day_slice["Strike"].max()
+                plot_min, plot_max = max(intended_min, real_min), min(intended_max, real_max)
 
-                smile_fig = go.Figure()
-                smile_fig.add_trace(go.Scatter(x=strike_grid, y=sigmas, mode="lines", name="Implied Vol"))
-                smile_fig.add_vline(x=F, line_dash="dot", line_color=COLOR["accent"],
-                                     annotation_text="Forward", annotation_position="top")
-                smile_fig.update_layout(xaxis_title="Strike", yaxis_title="Implied Vol", height=260)
-                apply_terminal_theme(smile_fig)
-                st.plotly_chart(smile_fig, width="stretch")
+                if plot_min >= plot_max:
+                    st.warning(
+                        f"Real market strike coverage for {sel_underlying} ({real_min:.2f}-{real_max:.2f}) "
+                        f"doesn't overlap the intended ±15% window around the forward ({intended_min:.2f}-"
+                        f"{intended_max:.2f}) — nothing to plot without extrapolating beyond real data."
+                    )
+                else:
+                    if plot_min > intended_min or plot_max < intended_max:
+                        st.caption(
+                            f"Chart restricted to {plot_min:.2f}-{plot_max:.2f} — the real market strike "
+                            f"coverage available ({real_min:.2f}-{real_max:.2f}) is narrower than the full "
+                            f"±15% window; no extrapolation is shown beyond what's actually quoted."
+                        )
+                    strike_grid = np.linspace(plot_min, plot_max, 60)
+                    sigmas = np.interp(strike_grid, day_slice["Strike"].values, day_slice["ImpliedVol"].values)
 
-                grid_fig = make_subplots(rows=2, cols=2, subplot_titles=["Delta", "Gamma", "Vega", "Theta"])
-                positions_rc = [(1, 1), (1, 2), (2, 1), (2, 2)]
-                for (name, values), (r, c) in zip(greek_curves.items(), positions_rc):
-                    grid_fig.add_trace(go.Scatter(x=strike_grid, y=values, mode="lines", name=name, showlegend=False),
-                                        row=r, col=c)
-                    grid_fig.add_vline(x=F, line_dash="dot", line_color=COLOR["accent"], row=r, col=c)
-                grid_fig.update_layout(height=520)
-                apply_terminal_theme(grid_fig)
-                st.plotly_chart(grid_fig, width="stretch")
+                    greek_curves = {g: [] for g in ["Delta", "Gamma", "Vega", "Theta"]}
+                    for k, sigma in zip(strike_grid, sigmas):
+                        g = black76_greeks(F, k, T, RISK_FREE_RATE_DEFAULT, sigma, sel_type)
+                        for name in greek_curves:
+                            greek_curves[name].append(g[name])
+
+                    smile_fig = go.Figure()
+                    smile_fig.add_trace(go.Scatter(x=strike_grid, y=sigmas, mode="lines", name="Implied Vol"))
+                    smile_fig.add_vline(x=F, line_dash="dot", line_color=COLOR["accent"],
+                                         annotation_text="Forward", annotation_position="top")
+                    smile_fig.update_layout(xaxis_title="Strike", yaxis_title="Implied Vol", height=260)
+                    apply_terminal_theme(smile_fig)
+                    st.plotly_chart(smile_fig, width="stretch")
+
+                    grid_fig = make_subplots(rows=2, cols=2, subplot_titles=["Delta", "Gamma", "Vega", "Theta"])
+                    positions_rc = [(1, 1), (1, 2), (2, 1), (2, 2)]
+                    for (name, values), (r, c) in zip(greek_curves.items(), positions_rc):
+                        grid_fig.add_trace(go.Scatter(x=strike_grid, y=values, mode="lines", name=name, showlegend=False),
+                                            row=r, col=c)
+                        grid_fig.add_vline(x=F, line_dash="dot", line_color=COLOR["accent"], row=r, col=c)
+                    grid_fig.update_layout(height=520)
+                    apply_terminal_theme(grid_fig)
+                    st.plotly_chart(grid_fig, width="stretch")
 
 # ==========================================================================
 # TAB 4 — Market Data: benchmark prices (Brent/WTI/TTF) and the implied
