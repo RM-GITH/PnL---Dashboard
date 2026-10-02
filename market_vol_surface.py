@@ -314,7 +314,13 @@ def build_market_vol_surface(ticker: str, commodity_label: str, r: float = RISK_
     maturity_grid["Date"] = as_of_date
     maturity_grid["UnderlyingContract"] = commodity_label
 
-    return maturity_grid[["Date", "UnderlyingContract", "ExpiryDate", "Strike", "ImpliedVol"]].reset_index(drop=True)
+    # Moneyness is kept alongside Strike (not just internally) because it's
+    # the only axis that stays consistent across maturities for plotting a
+    # 3D surface -- Strike itself shifts with the forward at each tenor, so
+    # pivoting by raw Strike would NOT line up into a clean grid. Extra
+    # column, fully backward-compatible: lookup_implied_vol() only reads
+    # the columns it needs and ignores the rest.
+    return maturity_grid[["Date", "UnderlyingContract", "ExpiryDate", "Strike", "Moneyness", "ImpliedVol"]].reset_index(drop=True)
 
 
 def build_full_market_vol_surface(as_of_date: pd.Timestamp = None) -> pd.DataFrame:
