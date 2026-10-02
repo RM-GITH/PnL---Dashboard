@@ -189,6 +189,35 @@ def map_underlying_to_commodity(underlying_contract: str) -> str:
     return COMMODITY_PREFIX_MAP[prefix]
 
 
+def resolve_surface_underlying(vol_surface: pd.DataFrame, underlying: str) -> str:
+    """
+    Returns the UnderlyingContract key ACTUALLY PRESENT in vol_surface that
+    should be used for `underlying` -- either an exact contract-month match
+    (e.g. "BRN Sep26" against the dummy surface), or, if none exists, the
+    commodity-level fallback (e.g. "BRENT" against market_vol_surface.py's
+    live output). Raises ValueError if neither exists.
+
+    EVERY caller that needs to look something up in a vol_surface by
+    underlying should go through this function, not re-implement the
+    match/fallback logic itself. That duplication is exactly how a real
+    bug happened: dashboard.py's Greeks-vs-Strike chart did its own raw
+    `vol_surface["UnderlyingContract"] == sel_underlying` lookup instead
+    of reusing this, and crashed with an IndexError the moment the live
+    market surface started being commodity-keyed instead of contract-
+    month-keyed (works fine against dummy data, breaks the instant a
+    live fetch actually succeeds -- a gap invisible to any test run from
+    an environment that can't reach Yahoo Finance at all).
+    """
+    if underlying in vol_surface["UnderlyingContract"].values:
+        return underlying
+    commodity = map_underlying_to_commodity(underlying)  # raises ValueError if no mapping exists
+    if commodity in vol_surface["UnderlyingContract"].values:
+        return commodity
+    raise ValueError(
+        f"No volatility surface data for underlying '{underlying}' (checked contract-month and commodity-level)."
+    )
+
+
 # ==========================================================================
 # 2. Loading data
 # ==========================================================================
@@ -317,19 +346,7 @@ def lookup_implied_vol(vol_surface: pd.DataFrame, underlying: str, expiry: pd.Ti
     see VOL_SURFACE_STALENESS_WARNING_DAYS and compute_live_option_greeks's
     "VolStalenessDays" column.
     """
-    sub = vol_surface[vol_surface["UnderlyingContract"] == underlying]
-    if sub.empty:
-        # No exact contract-month match -- fall back to the commodity-level
-        # surface (e.g. market_vol_surface.py's real, market-calibrated
-        # output, keyed by "BRENT"/"WTI" rather than a specific contract
-        # month) if one exists for this underlying's commodity.
-        try:
-            commodity = map_underlying_to_commodity(underlying)
-            sub = vol_surface[vol_surface["UnderlyingContract"] == commodity]
-        except ValueError:
-            pass
-    if sub.empty:
-        raise ValueError(f"No volatility surface data for underlying '{underlying}' (checked contract-month and commodity-level).")
+    sub = vol_surface[vol_surface["UnderlyingContract"] == resolve_surface_underlying(vol_surface, underlying)]
 
     nearest_expiry = min(sub["ExpiryDate"].unique(), key=lambda e: abs((pd.Timestamp(e) - expiry).days))
     sub = sub[sub["ExpiryDate"] == nearest_expiry]
@@ -487,3 +504,4 @@ if __name__ == "__main__":
 
     except FileNotFoundError as e:
         print(f"\n(Skipping full pipeline test -- data file not found: {e})")
+    
