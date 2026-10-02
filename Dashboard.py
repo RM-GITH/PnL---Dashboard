@@ -51,7 +51,7 @@ from greeks_engine import (
     compute_live_option_greeks,
     portfolio_greeks_summary,
     black76_greeks,
-    lookup_implied_vol,
+    get_vol_surface_slice,
     resolve_surface_underlying,
     RISK_FREE_RATE_DEFAULT,
     VOL_SURFACE_STALENESS_WARNING_DAYS,
@@ -761,39 +761,56 @@ with tab_greeks:
         elif days_to_expiry <= 0:
             st.warning(f"{sel_underlying}'s option expiry has passed the latest settlement date — nothing to plot.")
         else:
-            T = days_to_expiry / 365.0
-            strike_grid = np.linspace(F * 0.85, F * 1.15, 60)
-            vol_lookups = [lookup_implied_vol(vol_surface, sel_underlying, expiry, k, as_of) for k in strike_grid]
-            sigmas = [v for v, _ in vol_lookups]
-            chart_staleness = max(s for _, s in vol_lookups)
-            if chart_staleness > VOL_SURFACE_STALENESS_WARNING_DAYS:
+            # Resolve the real (Strike, ImpliedVol) slice ONCE -- not once
+            # per query strike -- and check it actually has enough distinct
+            # strikes to interpolate a smile from BEFORE sweeping across it.
+            # np.interp against a single point doesn't error; it silently
+            # returns that one constant for every query, which rendered as
+            # a flat "smile" with no warning anywhere -- a real bug this
+            # check exists specifically to catch.
+            day_slice, chart_staleness = get_vol_surface_slice(vol_surface, sel_underlying, expiry, as_of)
+
+            if day_slice["Strike"].nunique() < 2:
                 st.warning(
-                    f"This chart's vol surface lookup is {chart_staleness} days from the selected as-of "
-                    "date — the smile shown may not reflect current conditions."
+                    f"Only {day_slice['Strike'].nunique()} distinct strike(s) of real market data are "
+                    f"available for {sel_underlying} at the nearest matching expiry/date — not enough "
+                    "coverage to plot a smile. This happens when live market liquidity at this maturity "
+                    "was too thin to survive the no-extrapolation filtering in market_vol_surface.py."
                 )
-            greek_curves = {g: [] for g in ["Delta", "Gamma", "Vega", "Theta"]}
-            for k, sigma in zip(strike_grid, sigmas):
-                g = black76_greeks(F, k, T, RISK_FREE_RATE_DEFAULT, sigma, sel_type)
-                for name in greek_curves:
-                    greek_curves[name].append(g[name])
+            else:
+                if chart_staleness > VOL_SURFACE_STALENESS_WARNING_DAYS:
+                    st.warning(
+                        f"This chart's vol surface lookup is {chart_staleness} days from the selected as-of "
+                        "date — the smile shown may not reflect current conditions."
+                    )
 
-            smile_fig = go.Figure()
-            smile_fig.add_trace(go.Scatter(x=strike_grid, y=sigmas, mode="lines", name="Implied Vol"))
-            smile_fig.add_vline(x=F, line_dash="dot", line_color=COLOR["accent"],
-                                 annotation_text="Forward", annotation_position="top")
-            smile_fig.update_layout(xaxis_title="Strike", yaxis_title="Implied Vol", height=260)
-            apply_terminal_theme(smile_fig)
-            st.plotly_chart(smile_fig, width="stretch")
+                T = days_to_expiry / 365.0
+                strike_grid = np.linspace(F * 0.85, F * 1.15, 60)
+                sigmas = np.interp(strike_grid, day_slice["Strike"].values, day_slice["ImpliedVol"].values)
 
-            grid_fig = make_subplots(rows=2, cols=2, subplot_titles=["Delta", "Gamma", "Vega", "Theta"])
-            positions_rc = [(1, 1), (1, 2), (2, 1), (2, 2)]
-            for (name, values), (r, c) in zip(greek_curves.items(), positions_rc):
-                grid_fig.add_trace(go.Scatter(x=strike_grid, y=values, mode="lines", name=name, showlegend=False),
-                                    row=r, col=c)
-                grid_fig.add_vline(x=F, line_dash="dot", line_color=COLOR["accent"], row=r, col=c)
-            grid_fig.update_layout(height=520)
-            apply_terminal_theme(grid_fig)
-            st.plotly_chart(grid_fig, width="stretch")
+                greek_curves = {g: [] for g in ["Delta", "Gamma", "Vega", "Theta"]}
+                for k, sigma in zip(strike_grid, sigmas):
+                    g = black76_greeks(F, k, T, RISK_FREE_RATE_DEFAULT, sigma, sel_type)
+                    for name in greek_curves:
+                        greek_curves[name].append(g[name])
+
+                smile_fig = go.Figure()
+                smile_fig.add_trace(go.Scatter(x=strike_grid, y=sigmas, mode="lines", name="Implied Vol"))
+                smile_fig.add_vline(x=F, line_dash="dot", line_color=COLOR["accent"],
+                                     annotation_text="Forward", annotation_position="top")
+                smile_fig.update_layout(xaxis_title="Strike", yaxis_title="Implied Vol", height=260)
+                apply_terminal_theme(smile_fig)
+                st.plotly_chart(smile_fig, width="stretch")
+
+                grid_fig = make_subplots(rows=2, cols=2, subplot_titles=["Delta", "Gamma", "Vega", "Theta"])
+                positions_rc = [(1, 1), (1, 2), (2, 1), (2, 2)]
+                for (name, values), (r, c) in zip(greek_curves.items(), positions_rc):
+                    grid_fig.add_trace(go.Scatter(x=strike_grid, y=values, mode="lines", name=name, showlegend=False),
+                                        row=r, col=c)
+                    grid_fig.add_vline(x=F, line_dash="dot", line_color=COLOR["accent"], row=r, col=c)
+                grid_fig.update_layout(height=520)
+                apply_terminal_theme(grid_fig)
+                st.plotly_chart(grid_fig, width="stretch")
 
 # ==========================================================================
 # TAB 4 — Market Data: benchmark prices (Brent/WTI/TTF) and the implied
