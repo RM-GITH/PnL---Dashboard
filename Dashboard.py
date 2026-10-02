@@ -291,6 +291,30 @@ def get_data():
     )
     return trades, settles
 
+BENCHMARK_TICKERS = {"Brent (BZ=F)": "BZ=F", "WTI (CL=F)": "CL=F", "TTF Gas (TTF=F)": "TTF=F"}
+
+
+@st.cache_data(ttl=1800)  # 30 min: cheap (one batched yfinance call), fine to refresh often
+def get_benchmark_prices(lookback_days: int = 365):
+    """
+    Live daily close history for Brent, WTI, and TTF via market_data.py's
+    generic fetch_price_history -- same function, reused as-is, just with
+    three tickers instead of one. No offline fallback exists for WTI/TTF
+    (unlike settlement_prices.csv, which only ever covered the Brent
+    dummy book) -- a live-fetch failure here returns an empty frame and
+    a clear "unavailable" status rather than fabricating one.
+    """
+    from market_data import fetch_price_history
+    start = (pd.Timestamp.now() - pd.Timedelta(days=lookback_days)).normalize()
+    try:
+        wide = fetch_price_history(list(BENCHMARK_TICKERS.values()), start_date=start)
+        wide = wide.rename(columns={v: k for k, v in BENCHMARK_TICKERS.items()})
+        return wide, "live"
+    except Exception as e:
+        warnings.warn(f"Live benchmark price fetch failed: {e}", RuntimeWarning)
+        return pd.DataFrame(), "unavailable"
+
+
 @st.cache_data(ttl=86400)  # once daily: a vol surface build makes ~30-40 option-chain calls to Yahoo, and doesn't need refreshing more often than that
 def get_market_vol_surface():
     """
@@ -455,7 +479,9 @@ st.sidebar.button("Refresh live PnL", type="primary")
 # --------------------------------------------------------------------------
 # Tabs
 # --------------------------------------------------------------------------
-tab_portfolio, tab_risk, tab_greeks = st.tabs(["Portfolio Analysis", "Risk Metrics", "Greeks"])
+tab_portfolio, tab_risk, tab_greeks, tab_market = st.tabs(
+    ["Portfolio Analysis", "Risk Metrics", "Greeks", "Market Data"]
+)
 
 # ==========================================================================
 # TAB 1 — Portfolio Analysis
@@ -758,3 +784,131 @@ with tab_greeks:
             grid_fig.update_layout(height=520)
             apply_terminal_theme(grid_fig)
             st.plotly_chart(grid_fig, width="stretch")
+
+# ==========================================================================
+# TAB 4 — Market Data: benchmark prices (Brent/WTI/TTF) and the implied
+# vol surface built in the Greeks tab, viewed as smile curves or a 3D mesh
+# ==========================================================================
+with tab_market:
+    st.subheader("Benchmark Prices")
+    lookback_choice = st.radio(
+        "Lookback", ["6 months", "1 year", "2 years"], index=1, horizontal=True, key="benchmark_lookback"
+    )
+    lookback_days = {"6 months": 182, "1 year": 365, "2 years": 730}[lookback_choice]
+
+    prices, price_source = get_benchmark_prices(lookback_days)
+    if price_source != "live" or prices.empty:
+        st.warning(
+            "Live benchmark price data is currently unavailable (network or Yahoo Finance fetch failed). "
+            "There's no offline fallback for WTI/TTF yet — settlement_prices.csv only ever covered the "
+            "Brent dummy book."
+        )
+    else:
+        oil_cols = [c for c in prices.columns if c.startswith("Brent") or c.startswith("WTI")]
+        gas_cols = [c for c in prices.columns if c.startswith("TTF")]
+
+        if oil_cols:
+            oil_fig = go.Figure()
+            for col in oil_cols:
+                oil_fig.add_trace(go.Scatter(x=prices.index, y=prices[col], mode="lines", name=col))
+            oil_fig.update_layout(
+                title="Crude Oil — Brent vs WTI ($/bbl)", xaxis_title="Date", yaxis_title="$/bbl", height=380
+            )
+            apply_terminal_theme(oil_fig)
+            st.plotly_chart(oil_fig, width="stretch")
+
+        if gas_cols:
+            gas_fig = go.Figure()
+            for col in gas_cols:
+                gas_fig.add_trace(go.Scatter(x=prices.index, y=prices[col], mode="lines", name=col,
+                                              line=dict(color=COLOR["positive"])))
+            gas_fig.update_layout(
+                title="European Gas — Dutch TTF ($/MMBtu)", xaxis_title="Date", yaxis_title="$/MMBtu", height=320
+            )
+            apply_terminal_theme(gas_fig)
+            st.plotly_chart(gas_fig, width="stretch")
+
+        st.caption(
+            "Brent and WTI share $/bbl units and are plotted together; TTF is priced in $/MMBtu "
+            "(a different physical unit — gas vs. oil) and is kept on its own chart rather than a "
+            "dual-axis overlay, to avoid implying a direct price comparison that doesn't exist."
+        )
+
+    st.subheader("Implied Volatility Surface")
+    st.caption(
+        "Same live, market-calibrated surface used by the Greeks tab (BNO/USO listed options, "
+        "Black-76 implied vol, no extrapolation) — see the Greeks tab for per-commodity source "
+        "and coverage details."
+    )
+
+    try:
+        vol_surface_for_plot = get_market_vol_surface()
+    except Exception as e:
+        vol_surface_for_plot = pd.DataFrame()
+        st.error(f"Could not load volatility surface data: {e}")
+
+    if not vol_surface_for_plot.empty:
+        view_choice = st.radio("View", ["Smile curves", "3D Surface"], horizontal=True, key="vol_surface_view")
+
+        if view_choice == "Smile curves":
+            smile_fig = go.Figure()
+            for (underlying, expiry), grp in vol_surface_for_plot.groupby(["UnderlyingContract", "ExpiryDate"]):
+                grp = grp.sort_values("Strike")
+                label = f"{underlying} {pd.Timestamp(expiry).strftime('%Y-%m')}"
+                smile_fig.add_trace(go.Scatter(x=grp["Strike"], y=grp["ImpliedVol"], mode="lines+markers", name=label))
+            smile_fig.update_layout(xaxis_title="Strike", yaxis_title="Implied Vol", height=480)
+            apply_terminal_theme(smile_fig)
+            st.plotly_chart(smile_fig, width="stretch")
+
+        else:
+            # A 3D surface needs >=2 distinct maturities for a given underlying
+            # to mean anything -- the dummy fallback (one expiry per contract
+            # month) doesn't qualify, only a live multi-tenor market build does.
+            expiry_counts = vol_surface_for_plot.groupby("UnderlyingContract")["ExpiryDate"].nunique()
+            surface_candidates = expiry_counts[expiry_counts >= 2].index.tolist()
+
+            if not surface_candidates:
+                st.info(
+                    "A 3D surface needs multiple maturities for one underlying to be meaningful — only "
+                    "single-expiry data is currently available (e.g. dummy fallback mode, or thin live "
+                    "coverage). Smile curves are more informative right now."
+                )
+            elif "Moneyness" not in vol_surface_for_plot.columns:
+                st.info("This data source doesn't carry Moneyness (needed to align strikes across maturities) — showing smile curves instead is more reliable.")
+            else:
+                for underlying in surface_candidates:
+                    grp = vol_surface_for_plot[vol_surface_for_plot["UnderlyingContract"] == underlying].copy()
+                    grp = grp.dropna(subset=["Moneyness"])
+                    grp["MaturityMonths"] = (
+                        (pd.to_datetime(grp["ExpiryDate"]) - pd.to_datetime(grp["Date"])).dt.days / 30.44
+                    ).round(1)
+                    pivot = grp.pivot_table(index="MaturityMonths", columns="Moneyness", values="ImpliedVol")
+
+                    surf_fig = go.Figure(data=[go.Surface(
+                        z=pivot.values, x=pivot.columns, y=pivot.index, colorscale="Oranges",
+                        colorbar=dict(title="Vol", tickfont=dict(color=COLOR["text_secondary"])),
+                    )])
+                    surf_fig.update_layout(
+                        title=f"{underlying} — Implied Vol Surface",
+                        scene=dict(
+                            xaxis_title="Moneyness (Strike/Forward)", yaxis_title="Maturity (months)", zaxis_title="Implied Vol",
+                            xaxis=dict(backgroundcolor=COLOR["bg_base"], gridcolor=COLOR["border"], color=COLOR["text_secondary"]),
+                            yaxis=dict(backgroundcolor=COLOR["bg_base"], gridcolor=COLOR["border"], color=COLOR["text_secondary"]),
+                            zaxis=dict(backgroundcolor=COLOR["bg_base"], gridcolor=COLOR["border"], color=COLOR["text_secondary"]),
+                            bgcolor=COLOR["bg_base"],
+                        ),
+                        paper_bgcolor=COLOR["bg_base"],
+                        font=dict(family="IBM Plex Mono, monospace", color=COLOR["text_secondary"]),
+                        height=560,
+                        margin=dict(t=50, b=20),
+                    )
+                    st.plotly_chart(surf_fig, width="stretch")
+                    gaps = pivot.isna().sum().sum()
+                    if gaps > 0:
+                        st.caption(
+                            f"{gaps} grid point(s) are missing (shown as holes in the mesh) — real listed "
+                            "option coverage didn't reach that strike/maturity combination, and this surface "
+                            "never extrapolates to fill it in."
+                        )
+    else:
+        st.info("No volatility surface data available to plot.")
