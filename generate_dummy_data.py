@@ -1,17 +1,26 @@
 """
 generate_dummy_data.py
 =======================
-Creates two dummy inputs so the PnL engine has something to run on:
+SANDBOX / TEST DATA ONLY. Creates four dummy inputs for testing the
+engines and self-tests:
 
-1. trades_dummy.xlsx   - a trade blotter: every futures trade in the book
-2. settlement_prices.csv - the daily exchange settlement (close) price for
-                            each contract, from its first trade date to today
+1. trades_dummy.xlsx            - a dummy futures trade blotter
+2. settlement_prices.csv        - dummy daily settlement prices
+3. options_trades_dummy.xlsx    - a dummy options trade blotter
+4. volatility_surface_dummy.csv - a dummy implied vol surface
 
-In real life these would come from your OMS/back-office system (trades) and
-your market data vendor / exchange feed (settlement prices). Everything
-downstream (pnl_engine.py) only cares about the shape of these two files, so
-you can swap this generator for a real data source later without touching
-the PnL logic.
+IMPORTANT: this script only ever writes to the four _dummy-suffixed (or,
+for settlement_prices.csv, market-data-fed) files above. It NEVER touches
+trades.xlsx or options_trades.xlsx -- those are the REAL, user-maintained
+blotters the dashboard actually reads (see README.md). Running this
+script to regenerate test data is always safe and will never overwrite
+your real positions.
+
+In real life trades.xlsx/options_trades.xlsx would come from your
+OMS/back-office system, and settlement_prices.csv from your market data
+vendor. Everything downstream (pnl_engine.py, greeks_engine.py) only
+cares about the shape of these files, so you can swap any of them for a
+real data source later without touching the engine logic.
 """
 
 import numpy as np
