@@ -169,6 +169,26 @@ def implied_vol(market_price: float, F: float, K: float, T: float, r: float, opt
     return brentq(objective, vol_bracket[0], vol_bracket[1])
 
 
+# Maps a contract-month-specific UnderlyingContract (e.g. "BRN Sep26") to
+# the commodity-level label ("BRENT") used by market_vol_surface.py's
+# real, market-calibrated surface -- which isn't contract-month-specific
+# (it's built from ETF proxy options, which aren't tied to one futures
+# expiry). lookup_implied_vol() falls back to this mapping when no exact
+# contract-month match exists in the surface it's given.
+COMMODITY_PREFIX_MAP = {"BRN": "BRENT", "CL": "WTI", "WTI": "WTI"}
+
+
+def map_underlying_to_commodity(underlying_contract: str) -> str:
+    """Raises ValueError if the prefix isn't recognized -- fail loudly rather than guess."""
+    prefix = underlying_contract.split()[0]
+    if prefix not in COMMODITY_PREFIX_MAP:
+        raise ValueError(
+            f"No commodity mapping for underlying '{underlying_contract}' "
+            f"(expected one of these prefixes: {list(COMMODITY_PREFIX_MAP)})."
+        )
+    return COMMODITY_PREFIX_MAP[prefix]
+
+
 # ==========================================================================
 # 2. Loading data
 # ==========================================================================
@@ -299,7 +319,17 @@ def lookup_implied_vol(vol_surface: pd.DataFrame, underlying: str, expiry: pd.Ti
     """
     sub = vol_surface[vol_surface["UnderlyingContract"] == underlying]
     if sub.empty:
-        raise ValueError(f"No volatility surface data for underlying '{underlying}'.")
+        # No exact contract-month match -- fall back to the commodity-level
+        # surface (e.g. market_vol_surface.py's real, market-calibrated
+        # output, keyed by "BRENT"/"WTI" rather than a specific contract
+        # month) if one exists for this underlying's commodity.
+        try:
+            commodity = map_underlying_to_commodity(underlying)
+            sub = vol_surface[vol_surface["UnderlyingContract"] == commodity]
+        except ValueError:
+            pass
+    if sub.empty:
+        raise ValueError(f"No volatility surface data for underlying '{underlying}' (checked contract-month and commodity-level).")
 
     nearest_expiry = min(sub["ExpiryDate"].unique(), key=lambda e: abs((pd.Timestamp(e) - expiry).days))
     sub = sub[sub["ExpiryDate"] == nearest_expiry]
@@ -354,9 +384,18 @@ def compute_live_option_greeks(option_trades: pd.DataFrame, settles: pd.DataFram
         if F is None:
             continue
         T = days_to_expiry / 365.0
-        sigma, vol_staleness_days = lookup_implied_vol(
-            vol_surface, pos.UnderlyingContract, pos.ExpiryDate, pos.Strike, as_of_date
-        )
+        try:
+            sigma, vol_staleness_days = lookup_implied_vol(
+                vol_surface, pos.UnderlyingContract, pos.ExpiryDate, pos.Strike, as_of_date
+            )
+        except ValueError as e:
+            # No surface coverage at all for this underlying (e.g. a
+            # no-extrapolation market surface with zero usable points for
+            # this commodity). Skip just this position rather than letting
+            # one gap take down Greeks for the whole book.
+            import warnings
+            warnings.warn(f"Skipping {pos.UnderlyingContract} {pos.OptionType} {pos.Strike}: {e}", RuntimeWarning)
+            continue
         lot_size = lot_size_by_underlying.get(pos.UnderlyingContract, 1000)
 
         price = black76_price(F, pos.Strike, T, r, sigma, pos.OptionType)
