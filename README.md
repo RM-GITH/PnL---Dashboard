@@ -1,4 +1,3 @@
-# PnL---Dashboard
 # Brent Crude Futures — Book PnL & Risk Dashboard
 
 A Streamlit dashboard for a Brent crude futures book: mark-to-market P&L,
@@ -6,8 +5,12 @@ Value-at-Risk / Expected Shortfall, and aggregated options Greeks —
 built on top of a FIFO position-keeping engine and a Black-76 pricing
 engine.
 
-This is demo/portfolio code using **dummy trade and market data** — not
-connected to any real trading system or market data vendor.
+The dashboard reads positions from `trades.xlsx` / `options_trades.xlsx`
+(see **Adding / updating positions** below) — these ship pre-populated
+with sample data so the dashboard isn't empty on first run, but they're
+meant to be edited with your actual positions. Market data (settlement
+prices) still comes from Yahoo Finance live, falling back to a bundled
+CSV — see **Data source** below for that limitation.
 
 ## What it does
 
@@ -36,15 +39,52 @@ pnl_engine.py                   FIFO positions, daily MTM, live PnL (futures)
 risk_engine.py                  Historical + parametric VaR/ES (portfolio-agnostic)
 greeks_engine.py                Black-76 pricing/Greeks, FIFO positions (options)
 market_data.py                  Live settlement price fetch (Yahoo Finance) + CSV fallback
-generate_dummy_data.py          Generates all dummy data files below (run once, optional)
+generate_dummy_data.py          Generates the four sandbox files below (safe to re-run any time)
 
-trades_dummy.xlsx               Dummy futures trade blotter
-settlement_prices.csv           Dummy daily settlement prices
-options_trades_dummy.xlsx       Dummy options trade blotter
-volatility_surface_dummy.csv    Dummy implied volatility surface
+trades.xlsx                     REAL futures trade blotter — the dashboard reads this. Edit it.
+options_trades.xlsx             REAL options trade blotter — the dashboard reads this. Edit it.
+
+trades_dummy.xlsx               Sandbox/test futures blotter (generate_dummy_data.py's output only)
+settlement_prices.csv           Sandbox settlement prices + live-fetch fallback
+options_trades_dummy.xlsx       Sandbox/test options blotter (generate_dummy_data.py's output only)
+volatility_surface_dummy.csv    Sandbox implied volatility surface
 
 requirements.txt                Python dependencies
 ```
+
+## Adding / updating positions
+
+The dashboard reads positions from two files, which you edit directly in
+Excel:
+
+- **`trades.xlsx`** (sheet `Trades`) — futures trades. Columns: `TradeID`,
+  `TradeDate`, `Contract`, `BuySell` (exactly `BUY` or `SELL`), `Quantity`,
+  `Price`, `Trader`, `LotSize`, `Currency`.
+- **`options_trades.xlsx`** (sheet `OptionTrades`) — options trades.
+  Columns: `TradeID`, `TradeDate`, `UnderlyingContract`, `OptionType`
+  (`CALL`/`PUT`), `Strike`, `ExpiryDate`, `BuySell`, `Quantity`,
+  `Premium`, `Trader`, `LotSize`, `Currency`.
+
+**Workflow:** open the file in Excel, add a new row for the trade, save,
+then commit and push the updated file to GitHub (`git add`, `git commit`,
+`git push`, or drag-and-drop the updated file on github.com to replace
+it). Streamlit Community Cloud auto-redeploys on every push, so the new
+trade appears on the live dashboard shortly after.
+
+**Why not edit these inline on github.com?** `.xlsx` is a binary format —
+GitHub's web editor can only edit plain text files inline, so Excel files
+have to be edited locally and pushed back. This is a deliberate tradeoff:
+it keeps Excel's own validation/dropdowns for data entry, at the cost of
+one extra local step per update.
+
+**`BuySell` must be exactly `BUY` or `SELL`** (case-insensitive, no extra
+spaces) — anything else is rejected with a clear error rather than
+silently misinterpreted, by design (see `pnl_engine.py`/`greeks_engine.py`
+for why this matters).
+
+`trades_dummy.xlsx` / `options_trades_dummy.xlsx` are untouched by this
+workflow — they're sandbox files `generate_dummy_data.py` regenerates for
+testing, and the dashboard never reads them.
 
 ## Running locally
 
@@ -90,6 +130,10 @@ and options.
 
 ## Disclaimer
 
-Dummy data, for demonstration purposes only. Not connected to any real
-trading, risk, or market data system, and not intended to inform real
-trading or risk decisions.
+`trades.xlsx` / `options_trades.xlsx` ship with sample data but are meant
+to hold real positions if you choose to edit them. That said, the engines
+behind this dashboard (FIFO matching, VaR/ES, Black-76 Greeks) are
+portfolio/demo code — not independently audited, not connected to any
+licensed market data feed for per-contract pricing (see **Data source**
+above), and not intended as the sole basis for real trading or risk
+decisions.
