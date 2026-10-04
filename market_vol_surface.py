@@ -74,6 +74,7 @@ MATURITY_MONTHS_GRID = [1, 3, 6, 9, 12, 18, 24, 36]  # 8 points
 MIN_QUOTES_PER_EXPIRY = 4  # minimum surviving liquid quotes to attempt a smile for that expiry
 MIN_DAYS_TO_EXPIRY = 7      # sub-1-week expiries give unstable IVs (tiny T, pin risk, stale mids)
 MAX_REL_SPREAD = 0.50       # drop quotes whose (ask-bid)/mid > 50% -- the mid is noise, not a price
+LAST_PRICE_MAX_AGE_DAYS = 5  # last-trade fallback: only trades from the last 5 calendar days (covers a weekend + holiday)
 
 
 # ==========================================================================
@@ -94,13 +95,23 @@ def _get_spot_price(ticker_obj) -> float:
     return float(hist["Close"].dropna().iloc[-1])
 
 
+def _num(x) -> float:
+    """yfinance gives NaN/None for missing fields; `float(nan or 0)` stays NaN, so handle it explicitly."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if np.isnan(v) else v
+
+
 def fetch_raw_option_chain(ticker: str) -> tuple:
     """
     Pull every listed expiry's full chain (calls+puts) for `ticker`, plus
     the current spot price.
 
     Returns (raw_df, spot) where raw_df has columns: Expiry, OptionType
-    ('call'/'put'), Strike, Bid, Ask, Volume, OpenInterest.
+    ('call'/'put'), Strike, Bid, Ask, LastPrice, LastTradeDate, Volume,
+    OpenInterest.
     """
     if yf is None:
         raise ImportError("yfinance is not installed. Run: pip install yfinance")
@@ -119,10 +130,13 @@ def fetch_raw_option_chain(ticker: str) -> tuple:
             if df.empty:
                 continue
             for _, r in df.iterrows():
+                ltd = pd.to_datetime(r.get("lastTradeDate"), utc=True, errors="coerce")
                 rows.append({
                     "Expiry": expiry, "OptionType": option_type, "Strike": float(r["strike"]),
-                    "Bid": float(r.get("bid", 0.0) or 0.0), "Ask": float(r.get("ask", 0.0) or 0.0),
-                    "Volume": float(r.get("volume", 0) or 0), "OpenInterest": float(r.get("openInterest", 0) or 0),
+                    "Bid": _num(r.get("bid")), "Ask": _num(r.get("ask")),
+                    "LastPrice": _num(r.get("lastPrice")),
+                    "LastTradeDate": ltd.tz_localize(None) if pd.notna(ltd) else pd.NaT,
+                    "Volume": _num(r.get("volume")), "OpenInterest": _num(r.get("openInterest")),
                 })
     if not rows:
         raise RuntimeError(f"{ticker}: listed expiries exist but returned zero option rows.")
@@ -133,21 +147,46 @@ def fetch_raw_option_chain(ticker: str) -> tuple:
 # 2. Liquidity filtering
 # ==========================================================================
 
-def filter_liquid_quotes(raw: pd.DataFrame) -> pd.DataFrame:
+def filter_liquid_quotes(raw: pd.DataFrame, as_of_date: pd.Timestamp = None,
+                         max_last_age_days: int = LAST_PRICE_MAX_AGE_DAYS) -> pd.DataFrame:
     """
-    Keep only quotes with a genuine two-sided market AND real trading
-    activity. A resting bid/ask with zero volume and zero open interest
-    isn't a price anyone has transacted or committed size to -- including
-    it would let a stale/phantom quote masquerade as real market data.
+    Pick ONE price per option, from real market data only:
+
+      1. "mid"  -- a genuine two-sided quote (bid>0, ask>=bid, spread <= 50%
+                   of mid) with real activity (volume or open interest).
+      2. "last" -- ONLY if there is no usable two-sided quote: the last
+                   traded price, if that trade happened within the last
+                   `max_last_age_days` calendar days.
+
+    Why the fallback: outside US market hours -- and all weekend -- Yahoo
+    returns bid = ask = 0 for every listed option. With mids only, BOTH the
+    BNO and USO surfaces then fail to build ("no expiry had >= 4 liquid
+    quotes"). The last traded price is still a real transaction; it's just
+    less precise than a live mid (different strikes may have last traded at
+    different times), so every point carries its PriceBasis.
+
+    The output column is still called "Mid" (= the price used) so the rest
+    of the pipeline is unchanged.
     """
-    liquid = raw[
-        (raw["Bid"] > 0) & (raw["Ask"] > 0) & (raw["Ask"] >= raw["Bid"]) &
-        ((raw["Volume"] > 0) | (raw["OpenInterest"] > 0))
-    ].copy()
-    liquid["Mid"] = (liquid["Bid"] + liquid["Ask"]) / 2.0
+    if as_of_date is None:
+        as_of_date = pd.Timestamp.now().normalize()
+    active = (raw["Volume"] > 0) | (raw["OpenInterest"] > 0)
+
+    mid = (raw["Bid"] + raw["Ask"]) / 2.0
+    two_sided = (raw["Bid"] > 0) & (raw["Ask"] > 0) & (raw["Ask"] >= raw["Bid"]) & active
     # Thin ETF chains (BNO especially) often quote 0.05/0.40-type markets;
     # the mid of such a quote is meaningless and creates the jagged smile.
-    liquid = liquid[(liquid["Ask"] - liquid["Bid"]) / liquid["Mid"] <= MAX_REL_SPREAD]
+    two_sided &= ((raw["Ask"] - raw["Bid"]) / mid.where(mid > 0)) <= MAX_REL_SPREAD
+
+    if "LastPrice" in raw.columns:
+        age_days = (as_of_date - pd.to_datetime(raw["LastTradeDate"])).dt.days
+        last_ok = (~two_sided) & active & (raw["LastPrice"] > 0) & age_days.between(0, max_last_age_days)
+    else:
+        last_ok = pd.Series(False, index=raw.index)
+
+    liquid = raw[two_sided | last_ok].copy()
+    liquid["Mid"] = np.where(two_sided[liquid.index], mid[liquid.index], liquid.get("LastPrice", np.nan))
+    liquid["PriceBasis"] = np.where(two_sided[liquid.index], "mid", "last")
     return liquid
 
 
@@ -177,6 +216,7 @@ def compute_iv_points(liquid: pd.DataFrame, spot: float, r: float, as_of_date: p
             if row.empty:
                 continue
             mid = row["Mid"].iloc[0]
+            basis = row["PriceBasis"].iloc[0] if "PriceBasis" in row.columns else "mid"
             try:
                 vol = implied_vol(mid, F, strike, T, r, option_type=side)
             except Exception:
@@ -184,7 +224,7 @@ def compute_iv_points(liquid: pd.DataFrame, spot: float, r: float, as_of_date: p
             if not (0.01 < vol < 3.0):  # sanity bound; drop nonsensical solves
                 continue
             results.append({"Expiry": expiry, "T": T, "Strike": strike, "Forward": F,
-                             "Moneyness": strike / F, "ImpliedVol": vol})
+                             "Moneyness": strike / F, "ImpliedVol": vol, "PriceBasis": basis})
     return pd.DataFrame(results)
 
 
@@ -282,7 +322,7 @@ def interpolate_maturities(strike_grid: pd.DataFrame, as_of_date: pd.Timestamp,
 # ==========================================================================
 
 def build_market_vol_surface(ticker: str, commodity_label: str, r: float = RISK_FREE_RATE_DEFAULT,
-                              as_of_date: pd.Timestamp = None) -> pd.DataFrame:
+                              as_of_date: pd.Timestamp = None, report: dict = None) -> pd.DataFrame:
     """
     Full pipeline: fetch -> filter liquid -> compute IV (OTM, Black-76) ->
     filter usable expiries -> interpolate strikes -> interpolate
@@ -296,21 +336,35 @@ def build_market_vol_surface(ticker: str, commodity_label: str, r: float = RISK_
     if as_of_date is None:
         as_of_date = pd.Timestamp.now().normalize()
 
+    rep = report if report is not None else {}
     raw, spot = fetch_raw_option_chain(ticker)
-    liquid = filter_liquid_quotes(raw)
+    rep.update({"Spot": round(spot, 2), "Expiries listed": raw["Expiry"].nunique(), "Raw quotes": len(raw),
+                "Quotes with bid>0 & ask>0": int(((raw["Bid"] > 0) & (raw["Ask"] > 0)).sum())})
+    liquid = filter_liquid_quotes(raw, as_of_date)
+    rep.update({"Priced from live mid": int((liquid["PriceBasis"] == "mid").sum()),
+                "Priced from last trade": int((liquid["PriceBasis"] == "last").sum())})
     iv_points = compute_iv_points(liquid, spot, r, as_of_date)
+    rep["IV points solved"] = len(iv_points)
     usable = filter_usable_expiries(iv_points)
+    rep["Usable expiries"] = usable["Expiry"].nunique() if not usable.empty else 0
     if usable.empty:
-        raise RuntimeError(f"{ticker}: no expiry had >= {MIN_QUOTES_PER_EXPIRY} liquid quotes to build a smile.")
+        hint = (" Bid/ask are all zero -- usually the market is closed (weekend / after hours) and no option "
+                f"traded in the last {LAST_PRICE_MAX_AGE_DAYS} days."
+                if rep["Quotes with bid>0 & ask>0"] == 0 else "")
+        raise RuntimeError(f"{ticker}: no expiry had >= {MIN_QUOTES_PER_EXPIRY} usable quotes to build a smile.{hint}")
 
     strike_grid = interpolate_strikes(usable)
     if strike_grid.empty:
         raise RuntimeError(f"{ticker}: strike interpolation produced zero usable points.")
 
     maturity_grid = interpolate_maturities(strike_grid, as_of_date)
+    rep["Final grid points"] = len(maturity_grid)
     if maturity_grid.empty:
         raise RuntimeError(f"{ticker}: maturity interpolation produced zero usable points "
                             f"(fewer than 2 usable expiries at every moneyness point).")
+    basis = usable.get("PriceBasis", pd.Series(["mid"]))
+    rep["Price basis"] = "live mid" if (basis == "mid").all() else (
+        "last trade" if (basis == "last").all() else f"mixed ({(basis == 'last').mean():.0%} last trade)")
 
     # Final Strike is computed against the TARGET maturity's own forward
     # (spot * exp(r*T_target)) -- not the forward of whichever expiry
@@ -318,6 +372,7 @@ def build_market_vol_surface(ticker: str, commodity_label: str, r: float = RISK_
     maturity_grid["Strike"] = maturity_grid["Moneyness"] * spot * np.exp(r * maturity_grid["T"])
     maturity_grid["Date"] = as_of_date
     maturity_grid["UnderlyingContract"] = commodity_label
+    maturity_grid["PriceBasis"] = rep["Price basis"]
 
     # Moneyness is kept alongside Strike (not just internally) because it's
     # the only axis that stays consistent across maturities for plotting a
@@ -325,7 +380,110 @@ def build_market_vol_surface(ticker: str, commodity_label: str, r: float = RISK_
     # pivoting by raw Strike would NOT line up into a clean grid. Extra
     # column, fully backward-compatible: lookup_implied_vol() only reads
     # the columns it needs and ignores the rest.
-    return maturity_grid[["Date", "UnderlyingContract", "ExpiryDate", "Strike", "Moneyness", "ImpliedVol"]].reset_index(drop=True)
+    return maturity_grid[["Date", "UnderlyingContract", "ExpiryDate", "Strike", "Moneyness", "ImpliedVol",
+                          "PriceBasis"]].reset_index(drop=True)
+
+
+# ==========================================================================
+# 7. Futures-options SETTLEMENT chains (Brent / WTI) -- no ETF proxy
+# ==========================================================================
+
+MIN_SETTLE_FOR_IV = 0.05   # below ~5 ticks, 0.01 rounding dominates the price -> IV is noise
+
+
+def implied_vol_vectorized(price, F, K, T, r, is_call, tol=1e-10, max_iter=100):
+    """
+    Black-76 implied vol for whole arrays at once (bisection on the price,
+    which is monotonic in sigma -- same answer as greeks_engine.implied_vol's
+    brentq, ~100x faster for thousands of options). Returns NaN where the
+    price is outside the no-arbitrage bounds.
+    """
+    from scipy.stats import norm
+    price, F, K, T = (np.asarray(a, dtype=float) for a in (price, F, K, T))
+    is_call = np.asarray(is_call, dtype=bool)
+    df = np.exp(-r * T)
+    intrinsic = df * np.where(is_call, np.maximum(F - K, 0), np.maximum(K - F, 0))
+    upper = df * np.where(is_call, F, K)
+    valid = (price > intrinsic) & (price < upper) & (T > 0)
+
+    def b76(sig):
+        sq = sig * np.sqrt(T)
+        d1 = (np.log(F / K) + 0.5 * sq * sq) / sq
+        d2 = d1 - sq
+        call = df * (F * norm.cdf(d1) - K * norm.cdf(d2))
+        return np.where(is_call, call, call - df * (F - K))      # put via put-call parity
+
+    lo, hi = np.full(price.shape, 1e-6), np.full(price.shape, 5.0)
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        too_high = b76(mid) > price
+        hi = np.where(too_high, mid, hi)
+        lo = np.where(too_high, lo, mid)
+        if np.nanmax(hi - lo) < tol:
+            break
+    return np.where(valid, 0.5 * (lo + hi), np.nan)
+
+
+def build_surface_from_settlement_chain(chain: pd.DataFrame, r: float = RISK_FREE_RATE_DEFAULT,
+                                        min_premium: float = MIN_SETTLE_FOR_IV,
+                                        min_quotes: int = MIN_QUOTES_PER_EXPIRY) -> pd.DataFrame:
+    """
+    Implied vol surface straight from end-of-day settlement prices of options
+    ON FUTURES (Brent BRN, WTI CL) -- the real instrument, not BNO/USO.
+
+    Input columns (what an exchange / vendor EOD file provides):
+        Date, Commodity, UnderlyingContract, FuturesSettle, ExpiryDate,
+        OptionType (CALL/PUT), Strike, SettlePrice[, Volume, OpenInterest]
+
+    Per (Date, contract month):
+      - F = that contract month's futures settle, same day. No spot-to-
+        forward conversion: these options are written on the future itself.
+      - Out-of-the-money side only (call if K >= F, put if K < F): OTM
+        prices carry no early-exercise premium, so Black-76 (European) is
+        right even though Brent/WTI options are American-style.
+      - Settles below `min_premium` are skipped: at a 0.01 tick, a 0.02
+        option's implied vol is mostly rounding.
+      - Contract months with fewer than `min_quotes` usable strikes that day
+        are dropped rather than guessed.
+
+    Output: the same schema the rest of the code already reads (Date,
+    UnderlyingContract, ExpiryDate, Strike, Moneyness, ImpliedVol), plus
+    Commodity and PriceBasis="settlement". Strikes are in $/bbl and keyed by
+    contract month, so greeks_engine looks them up directly (no commodity
+    fallback, no ETF unit conversion).
+    """
+    need = {"Date", "UnderlyingContract", "FuturesSettle", "ExpiryDate", "OptionType", "Strike", "SettlePrice"}
+    missing = need - set(chain.columns)
+    if missing:
+        raise ValueError(f"Option chain is missing columns: {sorted(missing)}")
+
+    c = chain.copy()
+    c["Date"] = pd.to_datetime(c["Date"])
+    c["ExpiryDate"] = pd.to_datetime(c["ExpiryDate"])
+    c["OptionType"] = c["OptionType"].str.upper()
+    otm = ((c["OptionType"] == "CALL") & (c["Strike"] >= c["FuturesSettle"])) | \
+          ((c["OptionType"] == "PUT") & (c["Strike"] < c["FuturesSettle"]))
+    c = c[otm & (c["SettlePrice"] >= min_premium) & (c["ExpiryDate"] > c["Date"])]
+
+    T = (c["ExpiryDate"] - c["Date"]).dt.days.values / 365.0
+    vols = implied_vol_vectorized(c["SettlePrice"].values, c["FuturesSettle"].values, c["Strike"].values,
+                                  T, r, (c["OptionType"] == "CALL").values)
+    ok = np.isfinite(vols) & (vols > 0.01) & (vols < 3.0)   # unsolvable (no-arb violation) -> dropped, not guessed
+    c = c[ok]
+    rows = pd.DataFrame({
+        "Date": c["Date"].values, "UnderlyingContract": c["UnderlyingContract"].values,
+        "Commodity": c["Commodity"].values if "Commodity" in c.columns else None,
+        "ExpiryDate": c["ExpiryDate"].values, "Strike": c["Strike"].values,
+        "Forward": c["FuturesSettle"].values, "Moneyness": (c["Strike"] / c["FuturesSettle"]).values,
+        "ImpliedVol": vols[ok],
+    })
+    out = rows
+    if out.empty:
+        return out
+    counts = out.groupby(["Date", "UnderlyingContract"])["Strike"].transform("size")
+    out = out[counts >= min_quotes].copy()
+    out["PriceBasis"] = "settlement"
+    return out.sort_values(["UnderlyingContract", "Date", "Strike"]).reset_index(drop=True)
 
 
 def build_full_market_vol_surface(as_of_date: pd.Timestamp = None) -> pd.DataFrame:
