@@ -38,7 +38,7 @@ from pnl_engine import (
     open_position_summary,
 )
 from market_data import get_settlement_prices
-from market_vol_surface import build_market_vol_surface
+from market_vol_surface import build_market_vol_surface, build_surface_from_settlement_chain
 from risk_engine import (
     build_risk_inputs_from_book,
     compute_historical_var_es,
@@ -79,7 +79,8 @@ DUMMY_FILES = {
     "trades": "trades_dummy.xlsx",
     "options": "options_trades_dummy.xlsx",
     "settles": "settlement_prices_dummy.csv",
-    "vol_surface": "volatility_surface_dummy.csv",
+    "vol_surface": "volatility_surface_dummy.csv",   # "true" smile the dummy world was priced with (test_math only)
+    "option_chains": "option_chains_dummy.csv",      # Brent + WTI futures-option settlement chains
 }
 
 # ==========================================================================
@@ -345,53 +346,68 @@ def get_benchmark_prices(lookback_days: int = 365):
         return pd.DataFrame(), "unavailable"
 
 
-@st.cache_data(ttl=86400)  # once daily: a vol surface build makes ~30-40 option-chain calls to Yahoo, and doesn't need refreshing more often than that
-def get_market_vol_surface():
+@st.cache_data(ttl=3600, show_spinner="Building BNO/USO implied vol surface from Yahoo option chains…")
+def build_market_surfaces():
     """
-    Tries to build a REAL market-calibrated vol surface from BNO (Brent
-    proxy) and USO (WTI proxy) listed options -- see market_vol_surface.py
-    for the full method. Falls back to the static dummy surface if the
-    live build fails for ANY reason (no network, no liquid expiries,
-    yfinance error) -- never raises, same philosophy as
-    get_settlement_prices() in market_data.py.
+    Builds the REAL market-calibrated vol surfaces from BNO (Brent proxy) and
+    USO (WTI proxy) listed options -- see market_vol_surface.py for the
+    method. Never raises: returns (surface or None, report), where report
+    holds per-ticker stage counts and the failure reason, so the page can
+    say WHY a build failed instead of only "live fetch failed".
+
+    Cached for 1 hour, success or failure (a build is ~30-40 Yahoo calls, so
+    a failing build must not be retried on every click). The "Retry Yahoo
+    now" button in the Market Data tab clears this cache.
     """
-    surfaces = []
-    live_built = set()
+    surfaces, report = [], {}
     for ticker, commodity in (("BNO", "BRENT"), ("USO", "WTI")):
+        rep = {"Ticker": ticker}
         try:
-            s = build_market_vol_surface(ticker, commodity)
+            s = build_market_vol_surface(ticker, commodity, report=rep)
             if s.empty:
                 raise RuntimeError("zero usable points after filtering/interpolation")
             s["Source"] = "market"
             surfaces.append(s)
-            live_built.add(commodity)
+            rep["Status"] = "OK"
         except Exception as e:
             # Independent per-commodity failure: a BNO (Brent) failure
             # must not discard a successful USO (WTI) fetch, or vice versa.
+            rep["Status"] = f"FAILED — {type(e).__name__}: {e}"
             warnings.warn(f"Live market vol surface build failed for {commodity} ({ticker}): {e}", RuntimeWarning)
+        report[commodity] = rep
+    # NO dummy fallback, by design: a silent synthetic substitute is worse
+    # than a clear "no data" state.
+    return (pd.concat(surfaces, ignore_index=True) if surfaces else None), report
 
-    # NO dummy fallback for either commodity, by design: a silent synthetic
-    # substitute is worse than a clear "no data" state, because it's
-    # indistinguishable from real data in the UI unless someone checks the
-    # Source column specifically. If live data isn't available, say so
-    # plainly and show nothing, rather than quietly drawing a fake smile.
-    if "BRENT" not in live_built:
-        warnings.warn("No live BRENT vol surface available. No fallback is used.", RuntimeWarning)
-    if "WTI" not in live_built:
-        warnings.warn("No live WTI vol surface available. No fallback is used.", RuntimeWarning)
 
-    if not surfaces:
-        raise RuntimeError("No volatility surface data available at all (live fetch failed for both commodities, no fallback is used).")
+def get_market_vol_surface():
+    """Market surface, or RuntimeError naming each ticker's failure reason."""
+    surface, report = build_market_surfaces()
+    if surface is None:
+        reasons = " | ".join(f"{c}: {r.get('Status', '?')}" for c, r in report.items())
+        raise RuntimeError(f"No volatility surface data available (no fallback is used). {reasons}")
+    return surface
 
-    return pd.concat(surfaces, ignore_index=True)
+
+@st.cache_data(ttl=900)
+def get_dummy_chain_surface():
+    """
+    DUMMY MODE ONLY. Implied vol surface backed out (Black-76) from the dummy
+    Brent (BRN) and WTI (CL) futures-option settlement chains -- the same
+    calibration real Brent/WTI option settlements will go through once a data
+    source is connected. One smile per contract month per day, strikes in $/bbl.
+    """
+    chain = pd.read_csv(DUMMY_FILES["option_chains"], parse_dates=["Date", "ExpiryDate"])
+    surface = build_surface_from_settlement_chain(chain)
+    surface["Source"] = "dummy"
+    return surface
 
 
 @st.cache_data(ttl=900)  # cached separately per mode
 def get_options_data(mode: str):
     if mode == "dummy":
         option_trades = load_option_trades(DUMMY_FILES["options"])
-        vol_surface = load_volatility_surface(DUMMY_FILES["vol_surface"])
-        vol_surface["Source"] = "dummy"
+        vol_surface = get_dummy_chain_surface()
         return option_trades, vol_surface
     option_trades = load_option_trades("options_trades.xlsx")
     vol_surface = get_market_vol_surface()   # raises RuntimeError if Yahoo fails -- shown in the Greeks tab
@@ -729,7 +745,10 @@ with tab_greeks:
                 source = grp["Source"].iloc[0]
                 coverage = f"{grp['ExpiryDate'].min().strftime('%Y-%m')} to {grp['ExpiryDate'].max().strftime('%Y-%m')}"
                 dot = "🟢" if source == "market" else "🟡"
-                label = {"market": "LIVE market-calibrated", "dummy": "DUMMY (simulated)"}.get(source, "STATIC fallback")
+                label = {"market": "LIVE market-calibrated (ETF proxy)",
+                         "dummy": "DUMMY futures-option settlements"}.get(source, "STATIC fallback")
+                if source == "market" and "PriceBasis" in grp.columns and grp["PriceBasis"].iloc[0] != "live mid":
+                    label += f", priced from {grp['PriceBasis'].iloc[0]}"
                 lines.append(f"{dot} {underlying}: {label} ({coverage})")
             st.caption("Vol surface — " + " · ".join(lines))
         else:
@@ -961,17 +980,53 @@ with tab_market:
         )
 
     st.subheader("Implied Volatility Surface")
-    st.caption(
-        "Same live, market-calibrated surface used by the Greeks tab (BNO/USO listed options, "
-        "Black-76 implied vol, no extrapolation) — see the Greeks tab for per-commodity source "
-        "and coverage details."
-    )
+    if DATA_MODE == "dummy":
+        # Dummy mode: Brent + WTI futures options (not ETF proxies), implied
+        # vol backed out of the dummy settlement chains, as of the selected date.
+        st.caption(
+            "DUMMY — Brent (BRN) and WTI (CL) futures options. Implied vol backed out with Black-76 from "
+            "the end-of-day settlement chains in option_chains_dummy.csv (out-of-the-money side, settles "
+            "≥ $0.05), as of the selected date. Same surface the Greeks tab uses in dummy mode."
+        )
+        _chain_surf = get_dummy_chain_surface()
+        _d = max([d for d in _chain_surf["Date"].unique() if pd.Timestamp(d) <= as_of_date],
+                 default=_chain_surf["Date"].min())
+        vol_surface_for_plot = _chain_surf[_chain_surf["Date"] == _d]
+        st.caption(f"Chain date shown: {pd.Timestamp(_d):%Y-%m-%d}")
+    else:
+        st.caption(
+            "Same live, market-calibrated surface used by the Greeks tab (BNO/USO listed options, "
+            "Black-76 implied vol, no extrapolation) — see the Greeks tab for per-commodity source "
+            "and coverage details."
+        )
+        try:
+            vol_surface_for_plot = get_market_vol_surface()
+        except Exception as e:
+            vol_surface_for_plot = pd.DataFrame()
+            st.error(f"Could not load volatility surface data: {e}")
 
-    try:
-        vol_surface_for_plot = get_market_vol_surface()
-    except Exception as e:
-        vol_surface_for_plot = pd.DataFrame()
-        st.error(f"Could not load volatility surface data: {e}")
+    # Per-ticker build details (production / BNO-USO only): shows WHY a build
+    # failed (e.g. bid/ask all zero on a weekend) and which price basis was used.
+    _vs_report = build_market_surfaces()[1] if DATA_MODE != "dummy" else {}
+    _any_fail = any(not r.get("Status", "").startswith("OK") for r in _vs_report.values())
+    if _vs_report:
+        with st.expander("Vol surface build details (BNO / USO)", expanded=_any_fail):
+            st.dataframe(pd.DataFrame(_vs_report).T.astype(str), width="stretch")
+            st.caption(
+                "Prices: a live two-sided mid when one exists, otherwise the last traded price from the past "
+                "5 days (Yahoo shows bid = ask = 0 outside US market hours and at weekends). Results are cached "
+                "for 1 hour."
+            )
+            if st.button("Retry Yahoo now", key="retry_vol_surface"):
+                build_market_surfaces.clear()
+                st.rerun()
+
+    if DATA_MODE != "dummy" and not vol_surface_for_plot.empty and "PriceBasis" in vol_surface_for_plot.columns:
+        _bases = vol_surface_for_plot.groupby("UnderlyingContract")["PriceBasis"].first()
+        if (_bases != "live mid").any():
+            st.caption("Price basis — " + " · ".join(f"{u}: {b}" for u, b in _bases.items())
+                       + ". Last-trade prices are real trades but less precise than a live mid "
+                       "(strikes may have last traded at different times).")
 
     if not vol_surface_for_plot.empty:
         view_choice = st.radio("View", ["Smile curves", "3D Surface"], horizontal=True, key="vol_surface_view")
@@ -990,7 +1045,10 @@ with tab_market:
             # A 3D surface needs >=2 distinct maturities for a given underlying
             # to mean anything -- the dummy fallback (one expiry per contract
             # month) doesn't qualify, only a live multi-tenor market build does.
-            expiry_counts = vol_surface_for_plot.groupby("UnderlyingContract")["ExpiryDate"].nunique()
+            # Group by commodity when the data has it (contract-month surfaces:
+            # BRN Oct26/Nov26/Dec26 are the maturities of ONE Brent surface).
+            _grp_col = "Commodity" if "Commodity" in vol_surface_for_plot.columns else "UnderlyingContract"
+            expiry_counts = vol_surface_for_plot.groupby(_grp_col)["ExpiryDate"].nunique()
             surface_candidates = expiry_counts[expiry_counts >= 2].index.tolist()
 
             if not surface_candidates:
@@ -1003,8 +1061,21 @@ with tab_market:
                 st.info("This data source doesn't carry Moneyness (needed to align strikes across maturities) — showing smile curves instead is more reliable.")
             else:
                 for underlying in surface_candidates:
-                    grp = vol_surface_for_plot[vol_surface_for_plot["UnderlyingContract"] == underlying].copy()
+                    grp = vol_surface_for_plot[vol_surface_for_plot[_grp_col] == underlying].copy()
                     grp = grp.dropna(subset=["Moneyness"])
+                    if grp["Moneyness"].round(4).nunique() > 25:
+                        # Listed strikes differ by maturity -> put every smile on a common
+                        # moneyness grid (interpolation inside each smile's quoted range only).
+                        _m_grid = np.round(np.arange(0.75, 1.2501, 0.025), 3)
+                        _parts = []
+                        for (_e, _dt), g in grp.groupby(["ExpiryDate", "Date"]):
+                            g = g.sort_values("Moneyness")
+                            _in = (_m_grid >= g["Moneyness"].min()) & (_m_grid <= g["Moneyness"].max())
+                            _parts.append(pd.DataFrame({
+                                "ExpiryDate": _e, "Date": _dt, "Moneyness": _m_grid[_in],
+                                "ImpliedVol": np.interp(np.log(_m_grid[_in]), np.log(g["Moneyness"]), g["ImpliedVol"]),
+                            }))
+                        grp = pd.concat(_parts, ignore_index=True)
                     grp["MaturityMonths"] = (
                         (pd.to_datetime(grp["ExpiryDate"]) - pd.to_datetime(grp["Date"])).dt.days / 30.44
                     ).round(1)
