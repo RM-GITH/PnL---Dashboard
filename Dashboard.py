@@ -37,7 +37,6 @@ from pnl_engine import (
     compute_fifo_positions,
     open_position_summary,
 )
-from market_data import get_settlement_prices
 from market_vol_surface import build_market_vol_surface
 from risk_engine import (
     build_risk_inputs_from_book,
@@ -62,16 +61,13 @@ from greeks_engine import (
 st.set_page_config(page_title="Brent Futures Book — PnL & Risk", layout="wide")
 
 # ==========================================================================
-# DATA MODE
-#   "dummy" -- reads ONLY the *_dummy files produced by generate_dummy_data.py
-#              (one consistent simulated world). No Yahoo calls at all. Use
-#              this to check the maths (see test_math.py).
-#   "live"  -- real blotters + Yahoo settlements + BNO/USO market vol surface.
-#              ON HOLD until a proper per-contract settlement / Brent options
-#              data source is in place.
+# DATA SOURCES
+#   Portfolio / Risk / Greeks tabs -> the *_dummy files written by
+#     generate_dummy_data.py (one consistent simulated world, used to check
+#     the maths -- see test_math.py).
+#   Market Data tab -> live Yahoo Finance (benchmark prices + BNO/USO
+#     market-calibrated vol surface), as before.
 # ==========================================================================
-DATA_MODE = "dummy"
-
 DUMMY_FILES = {
     "trades": "trades_dummy.xlsx",
     "options": "options_trades_dummy.xlsx",
@@ -297,26 +293,13 @@ def style_risk_table(df: pd.DataFrame, magnitude_cols: list) -> "pd.io.formats.s
 # output -- re-running that script regenerates the _dummy files only and
 # will never touch your real trades.xlsx / options_trades.xlsx. See
 # README.md for the full workflow.
-@st.cache_data(ttl=900)  # 15 min: fresh enough to pick up a live price, gentle enough on Yahoo
+@st.cache_data(ttl=900)
 def get_data():
-    if DATA_MODE == "dummy":
-        trades = load_trades(DUMMY_FILES["trades"])
-        settles = load_settlement_prices(DUMMY_FILES["settles"])
-        settles["Source"] = "dummy"
-        return trades, settles
-
-    trades = load_trades("trades.xlsx")
-    contracts = sorted(trades["Contract"].unique())
-    start_date = trades["TradeDate"].min()
-
-    # All contracts currently map to the same Yahoo front-month proxy
-    # ticker -- see the limitation explained at the top of market_data.py.
-    # Swap in real per-expiry tickers here once available.
-    contract_ticker_map = {c: "BZ=F" for c in contracts}
-    settles = get_settlement_prices(
-        contract_ticker_map, start_date=start_date, csv_fallback_path="settlement_prices.csv"
-    )
+    trades = load_trades(DUMMY_FILES["trades"])
+    settles = load_settlement_prices(DUMMY_FILES["settles"])
+    settles["Source"] = "dummy"
     return trades, settles
+
 
 BENCHMARK_TICKERS = {"Brent (BZ=F)": "BZ=F", "WTI (CL=F)": "CL=F", "TTF Gas (TTF=F)": "TTF=F"}
 
@@ -385,13 +368,9 @@ def get_market_vol_surface():
 
 @st.cache_data(ttl=900)
 def get_options_data():
-    if DATA_MODE == "dummy":
-        option_trades = load_option_trades(DUMMY_FILES["options"])
-        vol_surface = load_volatility_surface(DUMMY_FILES["vol_surface"])
-        vol_surface["Source"] = "dummy"
-        return option_trades, vol_surface
-    option_trades = load_option_trades("options_trades.xlsx")
-    vol_surface = get_market_vol_surface()
+    option_trades = load_option_trades(DUMMY_FILES["options"])
+    vol_surface = load_volatility_surface(DUMMY_FILES["vol_surface"])
+    vol_surface["Source"] = "dummy"
     return option_trades, vol_surface
 
 
@@ -470,13 +449,10 @@ st.markdown(
 
 st.title("Brent Crude Futures — Book PnL & Risk")
 
-if DATA_MODE == "dummy":
-    st.warning(
-        "DUMMY DATA — math check only. Every number on this page comes from the simulated files "
-        "written by generate_dummy_data.py (one consistent price path, vol surface and blotter). "
-        "No live market data is used. Switch DATA_MODE to \"live\" in dashboard.py once a real "
-        "data source is in place."
-    )
+st.warning(
+    "DUMMY DATA on the Portfolio, Risk and Greeks tabs — math check only (simulated files from "
+    "generate_dummy_data.py). The Market Data tab shows live Yahoo Finance data."
+)
 
 # --------------------------------------------------------------------------
 # Sidebar: watchlist + live price override
@@ -663,12 +639,7 @@ with tab_risk:
         with st.expander("Correlation matrix (return series, current lookback)"):
             corr = returns.corr()
             st.dataframe(corr.round(2), width="stretch")
-            if DATA_MODE != "dummy" and corr.where(~np.eye(len(corr), dtype=bool)).max().max() > 0.95:
-                st.info(
-                    "Contracts are highly correlated because they're currently all priced off "
-                    "the same broadcast ticker (see market_data.py). Parametric VaR won't show "
-                    "much diversification benefit until each contract has an independent price series."
-                )
+            # (dummy contracts share one simulated price factor, so high correlation is expected)
     elif returns is not None:
         st.error("Not enough overlapping historical data to compute VaR/ES yet.")
 
@@ -897,13 +868,8 @@ with tab_market:
     )
     lookback_days = {"6 months": 182, "1 year": 365, "2 years": 730}[lookback_choice]
 
-    if DATA_MODE == "dummy":
-        prices, price_source = pd.DataFrame(), "dummy"
-    else:
-        prices, price_source = get_benchmark_prices(lookback_days)
-    if price_source == "dummy":
-        st.info("Benchmark prices (live Yahoo data) are switched off in dummy mode.")
-    elif price_source != "live" or prices.empty:
+    prices, price_source = get_benchmark_prices(lookback_days)
+    if price_source != "live" or prices.empty:
         st.warning(
             "Live benchmark price data is currently unavailable (network or Yahoo Finance fetch failed). "
             "There's no offline fallback for WTI/TTF yet — settlement_prices.csv only ever covered the "
@@ -941,21 +907,14 @@ with tab_market:
         )
 
     st.subheader("Implied Volatility Surface")
-    if DATA_MODE == "dummy":
-        st.caption("Dummy surface (volatility_surface_dummy.csv), as of the selected date -- the same one the Greeks tab uses.")
-    else:
-        st.caption(
-            "Same live, market-calibrated surface used by the Greeks tab (BNO/USO listed options, "
-            "Black-76 implied vol, no extrapolation) — see the Greeks tab for per-commodity source "
-            "and coverage details."
-        )
+    st.caption(
+        "Same live, market-calibrated surface used by the Greeks tab (BNO/USO listed options, "
+        "Black-76 implied vol, no extrapolation) — see the Greeks tab for per-commodity source "
+        "and coverage details."
+    )
 
     try:
-        vol_surface_for_plot = (get_options_data()[1] if DATA_MODE == "dummy" else get_market_vol_surface())
-        # Show the surface as of the selected date (dummy has one per day).
-        if "Date" in vol_surface_for_plot.columns and vol_surface_for_plot["Date"].nunique() > 1:
-            _d = min(vol_surface_for_plot["Date"].unique(), key=lambda d: abs((pd.Timestamp(d) - as_of_date).days))
-            vol_surface_for_plot = vol_surface_for_plot[vol_surface_for_plot["Date"] == _d]
+        vol_surface_for_plot = get_market_vol_surface()
     except Exception as e:
         vol_surface_for_plot = pd.DataFrame()
         st.error(f"Could not load volatility surface data: {e}")
