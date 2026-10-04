@@ -72,6 +72,8 @@ except ImportError:
 STRIKE_MONEYNESS_GRID = np.array([0.70, 0.775, 0.85, 0.925, 1.00, 1.075, 1.15, 1.225, 1.30])  # 9 points, 70%-130%
 MATURITY_MONTHS_GRID = [1, 3, 6, 9, 12, 18, 24, 36]  # 8 points
 MIN_QUOTES_PER_EXPIRY = 4  # minimum surviving liquid quotes to attempt a smile for that expiry
+MIN_DAYS_TO_EXPIRY = 7      # sub-1-week expiries give unstable IVs (tiny T, pin risk, stale mids)
+MAX_REL_SPREAD = 0.50       # drop quotes whose (ask-bid)/mid > 50% -- the mid is noise, not a price
 
 
 # ==========================================================================
@@ -143,6 +145,9 @@ def filter_liquid_quotes(raw: pd.DataFrame) -> pd.DataFrame:
         ((raw["Volume"] > 0) | (raw["OpenInterest"] > 0))
     ].copy()
     liquid["Mid"] = (liquid["Bid"] + liquid["Ask"]) / 2.0
+    # Thin ETF chains (BNO especially) often quote 0.05/0.40-type markets;
+    # the mid of such a quote is meaningless and creates the jagged smile.
+    liquid = liquid[(liquid["Ask"] - liquid["Bid"]) / liquid["Mid"] <= MAX_REL_SPREAD]
     return liquid
 
 
@@ -162,7 +167,7 @@ def compute_iv_points(liquid: pd.DataFrame, spot: float, r: float, as_of_date: p
     results = []
     for expiry, group in liquid.groupby("Expiry"):
         T = (expiry - as_of_date).days / 365.0
-        if T <= 0:
+        if T < MIN_DAYS_TO_EXPIRY / 365.0:
             continue
         F = spot * np.exp(r * T)
 
