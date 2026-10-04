@@ -147,7 +147,47 @@ def get_settlement_prices(contract_ticker_map: dict, start_date, end_date=None,
         )
         df = pd.read_csv(csv_fallback_path, parse_dates=["Date"])
         df["Source"] = "csv_fallback"
-        return df.sort_values(["Contract", "Date"]).reset_index(drop=True)
+        return _extend_fallback(df, list(contract_ticker_map), end_date)
+
+
+def _extend_fallback(df: pd.DataFrame, contracts: list, end_date=None) -> pd.DataFrame:
+    """
+    Make the CSV fallback cover every contract in the book up to `end_date`
+    (default: last business day), WITHOUT hiding what was invented:
+
+      - Source == "csv_fallback"              real row from the CSV
+      - Source == "csv_fallback_forward_filled" last real price carried forward
+      - Source == "csv_fallback_proxy"        contract absent from the CSV; price
+                                              series copied from another contract
+                                              (same limitation live mode has:
+                                              one BZ=F series for every month)
+
+    The tag is PER ROW. Downstream: VaR must drop non-"csv_fallback"/"live"
+    rows (a carried-forward price is a fake 0.00 return that shrinks VaR),
+    and the dashboard must report the WORST source present, not row 0.
+    """
+    end = pd.Timestamp(end_date) if end_date is not None else pd.Timestamp.today().normalize()
+    bdays = pd.bdate_range(df["Date"].min(), end)
+    known = sorted(df["Contract"].unique())
+    out = []
+    for c in contracts:
+        if c in df["Contract"].values:
+            src = df[df["Contract"] == c].set_index("Date").sort_index()
+            tag_missing = "csv_fallback_forward_filled"
+        else:
+            proxy = known[-1]
+            warnings.warn(f"'{c}' not in fallback CSV; using '{proxy}' prices as a proxy.", RuntimeWarning)
+            src = df[df["Contract"] == proxy].set_index("Date").sort_index()
+            src = src.assign(Source="csv_fallback_proxy")
+            tag_missing = "csv_fallback_forward_filled"
+        idx = src.index.union(bdays[bdays >= src.index.min()])
+        full = src.reindex(idx)
+        full["Source"] = full["Source"].fillna(tag_missing)
+        full["SettlePrice"] = full["SettlePrice"].ffill()
+        full["Contract"] = c
+        out.append(full.rename_axis("Date").reset_index())
+    res = pd.concat(out, ignore_index=True)
+    return res[["Date", "Contract", "SettlePrice", "Source"]].sort_values(["Contract", "Date"]).reset_index(drop=True)
 
 
 def fetch_brent_settlements_institutional(contracts: list[str], start_date, end_date=None) -> pd.DataFrame:
@@ -177,7 +217,7 @@ def main():
                          help="Print what would be fetched without overwriting settlement_prices.csv")
     args = parser.parse_args()
 
-    trades = pd.read_excel("trades_dummy.xlsx", sheet_name="Trades")
+    trades = pd.read_excel("trades.xlsx", sheet_name="Trades")  # real blotter, not the dummy one
     trades["TradeDate"] = pd.to_datetime(trades["TradeDate"])
     contracts = sorted(trades["Contract"].unique())
     start_date = trades["TradeDate"].min()
