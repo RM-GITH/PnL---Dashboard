@@ -325,25 +325,52 @@ def get_data(mode: str):
 BENCHMARK_TICKERS = {"Brent (BZ=F)": "BZ=F", "WTI (CL=F)": "CL=F", "TTF Gas (TTF=F)": "TTF=F"}
 
 
-@st.cache_data(ttl=1800)  # 30 min: cheap (one batched yfinance call), fine to refresh often
+@st.cache_data(ttl=1800)  # 30 min: three small yfinance calls, fine to refresh often
 def get_benchmark_prices(lookback_days: int = 365):
     """
-    Live daily close history for Brent, WTI, and TTF via market_data.py's
-    generic fetch_price_history -- same function, reused as-is, just with
-    three tickers instead of one. No offline fallback exists for WTI/TTF
-    (unlike settlement_prices.csv, which only ever covered the Brent
-    dummy book) -- a live-fetch failure here returns an empty frame and
-    a clear "unavailable" status rather than fabricating one.
+    Live daily close history for Brent, WTI and TTF via market_data.py's
+    fetch_price_history -- ONE TICKER AT A TIME, with a retry.
+
+    Why not one batched call any more: when Yahoo drops a single ticker from
+    a batch (rate limiting -- e.g. right after the ~40 option-chain calls of
+    the vol surface build -- or a temporary hiccup on BZ=F), yf.download
+    still "succeeds" and just returns that column as all-NaN, so Brent
+    silently vanished from the chart. Fetching each ticker on its own means
+    one failure can't blank the others, and the failure is reported by name.
+
+    Returns (wide, status, missing): wide = Date index, one column per
+    benchmark that returned data; status = "live" if at least one did;
+    missing = {benchmark name: reason} for the ones that didn't.
     """
+    import time
     from market_data import fetch_price_history
     start = (pd.Timestamp.now() - pd.Timedelta(days=lookback_days)).normalize()
-    try:
-        wide = fetch_price_history(list(BENCHMARK_TICKERS.values()), start_date=start)
-        wide = wide.rename(columns={v: k for k, v in BENCHMARK_TICKERS.items()})
-        return wide, "live"
-    except Exception as e:
-        warnings.warn(f"Live benchmark price fetch failed: {e}", RuntimeWarning)
-        return pd.DataFrame(), "unavailable"
+    series, missing = {}, {}
+    for name, ticker in BENCHMARK_TICKERS.items():
+        last_err = "no data returned"
+        for attempt in range(2):
+            try:
+                wide = fetch_price_history([ticker], start_date=start)
+                col = wide[ticker] if ticker in wide.columns else wide.iloc[:, 0]
+                col = col.dropna()
+                if not col.empty:
+                    series[name] = col
+                    break
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+            if attempt == 0:
+                time.sleep(1.5)       # brief back-off before the single retry
+        if name not in series:
+            missing[name] = last_err
+            warnings.warn(f"Live benchmark price fetch failed for {name}: {last_err}", RuntimeWarning)
+    if not series:
+        return pd.DataFrame(), "unavailable", missing
+    # Normalise to calendar dates: Yahoo stamps European (TTF) and US (BZ, CL)
+    # sessions differently, which can otherwise mis-align the joined index.
+    for k in series:
+        idx = pd.to_datetime(series[k].index)
+        series[k].index = (idx.tz_localize(None) if idx.tz is not None else idx).normalize()
+    return pd.DataFrame(series).sort_index(), "live", missing
 
 
 @st.cache_data(ttl=3600, show_spinner="Building BNO/USO implied vol surface from Yahoo option chains…")
@@ -941,7 +968,17 @@ with tab_market:
     )
     lookback_days = {"6 months": 182, "1 year": 365, "2 years": 730}[lookback_choice]
 
-    prices, price_source = get_benchmark_prices(lookback_days)
+    prices, price_source, missing_benchmarks = get_benchmark_prices(lookback_days)
+    if missing_benchmarks and price_source == "live":
+        st.warning(
+            "Yahoo Finance returned no data for: "
+            + "; ".join(f"**{n}** ({why[:120]})" for n, why in missing_benchmarks.items())
+            + ". Usually temporary rate limiting -- the other benchmarks are shown below; "
+            "data refreshes within 30 minutes."
+        )
+        if st.button("Retry benchmark prices now", key="retry_benchmarks"):
+            get_benchmark_prices.clear()
+            st.rerun()
     if price_source != "live" or prices.empty:
         st.warning(
             "Live benchmark price data is currently unavailable (network or Yahoo Finance fetch failed). "
@@ -955,7 +992,8 @@ with tab_market:
         if oil_cols:
             oil_fig = go.Figure()
             for col in oil_cols:
-                oil_fig.add_trace(go.Scatter(x=prices.index, y=prices[col], mode="lines", name=col))
+                _sr = prices[col].dropna()   # each series on its own dates -> no breaks on the other market's holidays
+                oil_fig.add_trace(go.Scatter(x=_sr.index, y=_sr.values, mode="lines", name=col))
             oil_fig.update_layout(
                 title="Crude Oil — Brent vs WTI ($/bbl)", xaxis_title="Date", yaxis_title="$/bbl", height=380
             )
@@ -965,7 +1003,8 @@ with tab_market:
         if gas_cols:
             gas_fig = go.Figure()
             for col in gas_cols:
-                gas_fig.add_trace(go.Scatter(x=prices.index, y=prices[col], mode="lines", name=col,
+                _sr = prices[col].dropna()
+                gas_fig.add_trace(go.Scatter(x=_sr.index, y=_sr.values, mode="lines", name=col,
                                               line=dict(color=COLOR["positive"])))
             gas_fig.update_layout(
                 title="European Gas — Dutch TTF ($/MMBtu)", xaxis_title="Date", yaxis_title="$/MMBtu", height=320
