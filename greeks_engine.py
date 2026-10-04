@@ -350,8 +350,87 @@ def get_vol_surface_slice(vol_surface: pd.DataFrame, underlying: str, expiry: pd
     return day_slice[["Strike", "ImpliedVol"]].reset_index(drop=True), date_staleness_days
 
 
+def smile_vols(vol_surface: pd.DataFrame, underlying: str, F: float, strikes, T: float,
+               as_of_date: pd.Timestamp):
+    """
+    Moneyness-based vol lookup -- the CORRECT way to read the market surface.
+
+    Why: market_vol_surface.py calibrates on ETF options (BNO ~$30, USO ~$75).
+    Its absolute "Strike" column is in ETF price units, NOT Brent $/bbl, so
+    interpolating a Brent strike (e.g. 82) against it lands outside the grid
+    and np.interp clamps EVERY option to the same wing vol. Moneyness (K/F)
+    is unit-free and is what transfers from the ETF to the futures.
+
+    Steps:
+      1. Nearest surface Date to as_of_date.
+      2. For each tenor on that date, interpolate vol in LOG-moneyness.
+      3. Interpolate TOTAL VARIANCE (sigma^2 * t) across tenors to the
+         option's own T (not "nearest tenor", which priced an 11-day option
+         with a 1-month vol).
+    Points outside the quoted moneyness / tenor range are held flat at the
+    boundary AND flagged, so callers can warn rather than silently trust them.
+
+    Returns (vols ndarray, extrapolated bool ndarray, date_staleness_days).
+    """
+    strikes = np.atleast_1d(np.asarray(strikes, dtype=float))
+    resolved = resolve_surface_underlying(vol_surface, underlying)
+    sub = vol_surface[vol_surface["UnderlyingContract"] == resolved].copy()
+    if "Moneyness" not in sub.columns:
+        raise ValueError("Vol surface has no Moneyness column; cannot do a unit-free lookup.")
+
+    nearest_date = min(sub["Date"].unique(), key=lambda d: abs((pd.Timestamp(d) - as_of_date).days))
+    sub = sub[sub["Date"] == nearest_date]
+    staleness = abs((pd.Timestamp(nearest_date) - as_of_date).days)
+
+    target_lm = np.log(strikes / F)
+    tenor_T, tenor_vols, outside_m = [], [], np.zeros(len(strikes), dtype=bool)
+    for expiry, g in sub.groupby("ExpiryDate"):
+        g = g.sort_values("Moneyness")
+        if g["Moneyness"].nunique() < 2:
+            continue
+        lm = np.log(g["Moneyness"].values)
+        tenor_T.append((pd.Timestamp(expiry) - pd.Timestamp(nearest_date)).days / 365.0)
+        tenor_vols.append(np.interp(target_lm, lm, g["ImpliedVol"].values))
+        outside_m |= (target_lm < lm.min()) | (target_lm > lm.max())
+    if not tenor_T:
+        raise ValueError(f"No tenor with >=2 moneyness points for '{underlying}'.")
+
+    order = np.argsort(tenor_T)
+    tenor_T = np.array(tenor_T)[order]
+    tenor_vols = np.array(tenor_vols)[order]          # shape (n_tenors, n_strikes)
+
+    if len(tenor_T) == 1:
+        vols = tenor_vols[0]
+        outside_t = abs(T - tenor_T[0]) > 1e-9
+    else:
+        total_var = tenor_vols ** 2 * tenor_T[:, None]
+        T_clamped = min(max(T, tenor_T[0]), tenor_T[-1])
+        w = np.array([np.interp(T_clamped, tenor_T, total_var[:, j]) for j in range(len(strikes))])
+        vols = np.sqrt(w / T_clamped)                 # flat vol beyond the ladder ends
+        outside_t = T < tenor_T[0] or T > tenor_T[-1]
+
+    return vols, outside_m | outside_t, staleness
+
+
 def lookup_implied_vol(vol_surface: pd.DataFrame, underlying: str, expiry: pd.Timestamp,
-                        strike: float, as_of_date: pd.Timestamp):
+                        strike: float, as_of_date: pd.Timestamp, forward: float = None):
+    """
+    If `forward` is given and the surface carries Moneyness (the live market
+    surface does), delegates to smile_vols() -- the correct, unit-free path.
+    The absolute-strike path is kept only for contract-month surfaces quoted
+    in the same units as the book (volatility_surface_dummy.csv).
+    Returns (vol, staleness_days, extrapolated_flag).
+    """
+    if forward is not None and "Moneyness" in vol_surface.columns:
+        T = max((expiry - as_of_date).days, 1) / 365.0
+        vols, extrap, stale = smile_vols(vol_surface, underlying, forward, [strike], T, as_of_date)
+        return float(vols[0]), stale, bool(extrap[0])
+    vol, stale = _lookup_implied_vol_absolute(vol_surface, underlying, expiry, strike, as_of_date)
+    return vol, stale, False
+
+
+def _lookup_implied_vol_absolute(vol_surface: pd.DataFrame, underlying: str, expiry: pd.Timestamp,
+                                  strike: float, as_of_date: pd.Timestamp):
     """
     Nearest-date, nearest-expiry, strike-interpolated vol lookup.
 
@@ -436,8 +515,8 @@ def compute_live_option_greeks(option_trades: pd.DataFrame, settles: pd.DataFram
             continue
         T = days_to_expiry / 365.0
         try:
-            sigma, vol_staleness_days = lookup_implied_vol(
-                vol_surface, pos.UnderlyingContract, pos.ExpiryDate, pos.Strike, as_of_date
+            sigma, vol_staleness_days, vol_extrapolated = lookup_implied_vol(
+                vol_surface, pos.UnderlyingContract, pos.ExpiryDate, pos.Strike, as_of_date, forward=F
             )
         except ValueError as e:
             # No surface coverage at all for this underlying (e.g. a
@@ -457,7 +536,8 @@ def compute_live_option_greeks(option_trades: pd.DataFrame, settles: pd.DataFram
             "UnderlyingContract": pos.UnderlyingContract, "OptionType": pos.OptionType,
             "Strike": pos.Strike, "ExpiryDate": pos.ExpiryDate, "DaysToExpiry": days_to_expiry,
             "NetQty": pos.NetQty, "AvgEntryPremium": pos.AvgEntryPremium,
-            "Forward": F, "ImpliedVol": sigma, "VolStalenessDays": vol_staleness_days, "TheoPrice": price,
+            "Forward": F, "Moneyness": pos.Strike / F, "ImpliedVol": sigma,
+            "VolExtrapolated": vol_extrapolated, "VolStalenessDays": vol_staleness_days, "TheoPrice": price,
             "Delta": greeks["Delta"], "Gamma": greeks["Gamma"], "Vega": greeks["Vega"],
             "Theta": greeks["Theta"], "Rho": greeks["Rho"],
             "PositionDelta": scale * greeks["Delta"], "PositionGamma": scale * greeks["Gamma"],
@@ -518,7 +598,7 @@ if __name__ == "__main__":
         from pnl_engine import load_settlement_prices
 
         option_trades = load_option_trades("options_trades_dummy.xlsx")
-        settles = load_settlement_prices("settlement_prices.csv")
+        settles = load_settlement_prices("settlement_prices_dummy.csv")
         vol_surface = load_volatility_surface("volatility_surface_dummy.csv")
 
         open_lots, realized_df = compute_option_fifo_positions(option_trades)
