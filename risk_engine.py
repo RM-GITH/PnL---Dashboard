@@ -286,7 +286,7 @@ if __name__ == "__main__":
         from pnl_engine import load_trades, load_settlement_prices
 
         trades = load_trades("trades_dummy.xlsx")
-        settles = load_settlement_prices("settlement_prices.csv")
+        settles = load_settlement_prices("settlement_prices_dummy.csv")
         returns, positions = build_risk_inputs_from_book(trades, settles)
 
         print(f"\nBrent book positions (barrels): \n{positions.to_string()}")
