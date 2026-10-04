@@ -31,6 +31,7 @@ import streamlit as st
 
 from pnl_engine import (
     load_trades,
+    load_settlement_prices,
     compute_daily_mtm,
     book_summary,
     compute_fifo_positions,
@@ -46,17 +47,37 @@ from risk_engine import (
 )
 from greeks_engine import (
     load_option_trades,
+    load_volatility_surface,
     compute_option_fifo_positions,
     compute_live_option_greeks,
     portfolio_greeks_summary,
     black76_greeks,
     get_vol_surface_slice,
+    smile_vols,
     resolve_surface_underlying,
     RISK_FREE_RATE_DEFAULT,
     VOL_SURFACE_STALENESS_WARNING_DAYS,
 )
 
 st.set_page_config(page_title="Brent Futures Book — PnL & Risk", layout="wide")
+
+# ==========================================================================
+# DATA MODE
+#   "dummy" -- reads ONLY the *_dummy files produced by generate_dummy_data.py
+#              (one consistent simulated world). No Yahoo calls at all. Use
+#              this to check the maths (see test_math.py).
+#   "live"  -- real blotters + Yahoo settlements + BNO/USO market vol surface.
+#              ON HOLD until a proper per-contract settlement / Brent options
+#              data source is in place.
+# ==========================================================================
+DATA_MODE = "dummy"
+
+DUMMY_FILES = {
+    "trades": "trades_dummy.xlsx",
+    "options": "options_trades_dummy.xlsx",
+    "settles": "settlement_prices_dummy.csv",
+    "vol_surface": "volatility_surface_dummy.csv",
+}
 
 # ==========================================================================
 # Design tokens (terminal aesthetic)
@@ -278,6 +299,12 @@ def style_risk_table(df: pd.DataFrame, magnitude_cols: list) -> "pd.io.formats.s
 # README.md for the full workflow.
 @st.cache_data(ttl=900)  # 15 min: fresh enough to pick up a live price, gentle enough on Yahoo
 def get_data():
+    if DATA_MODE == "dummy":
+        trades = load_trades(DUMMY_FILES["trades"])
+        settles = load_settlement_prices(DUMMY_FILES["settles"])
+        settles["Source"] = "dummy"
+        return trades, settles
+
     trades = load_trades("trades.xlsx")
     contracts = sorted(trades["Contract"].unique())
     start_date = trades["TradeDate"].min()
@@ -358,6 +385,11 @@ def get_market_vol_surface():
 
 @st.cache_data(ttl=900)
 def get_options_data():
+    if DATA_MODE == "dummy":
+        option_trades = load_option_trades(DUMMY_FILES["options"])
+        vol_surface = load_volatility_surface(DUMMY_FILES["vol_surface"])
+        vol_surface["Source"] = "dummy"
+        return option_trades, vol_surface
     option_trades = load_option_trades("options_trades.xlsx")
     vol_surface = get_market_vol_surface()
     return option_trades, vol_surface
@@ -397,13 +429,24 @@ for c in contracts:
     c_prices = settles.loc[settles["Contract"] == c].sort_values("Date")["SettlePrice"]
     if len(c_prices) >= 2:
         prev_settle_by_contract[c] = c_prices.iloc[-2]
-data_source = settles["Source"].iloc[0] if "Source" in settles.columns and len(settles) else "unknown"
+# Report the WORST source present, not row 0 (row 0 is the oldest row, which
+# is always real -- so forward-filled / proxy prices were invisible before).
+_src_rank = ["live", "dummy", "csv_fallback", "csv_fallback_forward_filled", "csv_fallback_proxy"]
+_present = set(settles["Source"]) if "Source" in settles.columns and len(settles) else {"unknown"}
+data_source = max(_present, key=lambda x: _src_rank.index(x) if x in _src_rank else 99)
+REAL_SOURCES = {"live", "dummy", "csv_fallback", "csv_fallback_proxy"}  # observed price moves (proxy = copied real series)
 
 # --------------------------------------------------------------------------
 # Status bar
 # --------------------------------------------------------------------------
 dot_class = "live" if data_source == "live" else "fallback"
-source_text = "LIVE — YAHOO FINANCE" if data_source == "live" else "STATIC FALLBACK — settlement_prices.csv"
+source_text = {
+    "live": "LIVE — YAHOO FINANCE",
+    "dummy": "DUMMY DATA — settlement_prices_dummy.csv (simulated, for math checks only)",
+    "csv_fallback": "STATIC FALLBACK — settlement_prices.csv",
+    "csv_fallback_forward_filled": "STATIC FALLBACK + FORWARD-FILLED PRICES (not real quotes)",
+    "csv_fallback_proxy": "STATIC FALLBACK + PROXY PRICES for contracts missing from the CSV",
+}.get(data_source, "UNKNOWN SOURCE")
 
 # The actual last settlement date on/before the selected As Of date --
 # can differ from as_of_date itself if that date falls on a weekend/
@@ -426,6 +469,14 @@ st.markdown(
 )
 
 st.title("Brent Crude Futures — Book PnL & Risk")
+
+if DATA_MODE == "dummy":
+    st.warning(
+        "DUMMY DATA — math check only. Every number on this page comes from the simulated files "
+        "written by generate_dummy_data.py (one consistent price path, vol surface and blotter). "
+        "No live market data is used. Switch DATA_MODE to \"live\" in dashboard.py once a real "
+        "data source is in place."
+    )
 
 # --------------------------------------------------------------------------
 # Sidebar: watchlist + live price override
@@ -552,7 +603,10 @@ with tab_risk:
     horizon_days = 1 if horizon_choice == "1-day" else 10
 
     try:
-        returns, positions = build_risk_inputs_from_book(trades, settles)
+        # Only real prices feed VaR: carried-forward rows are artificial
+        # zero returns and would understate risk.
+        settles_real = settles[settles["Source"].isin(REAL_SOURCES)] if "Source" in settles.columns else settles
+        returns, positions = build_risk_inputs_from_book(trades, settles_real)
     except Exception as e:
         st.error(f"Could not build risk inputs from the current book: {e}")
         returns, positions = None, None
@@ -609,7 +663,7 @@ with tab_risk:
         with st.expander("Correlation matrix (return series, current lookback)"):
             corr = returns.corr()
             st.dataframe(corr.round(2), width="stretch")
-            if corr.where(~np.eye(len(corr), dtype=bool)).max().max() > 0.95:
+            if DATA_MODE != "dummy" and corr.where(~np.eye(len(corr), dtype=bool)).max().max() > 0.95:
                 st.info(
                     "Contracts are highly correlated because they're currently all priced off "
                     "the same broadcast ticker (see market_data.py). Parametric VaR won't show "
@@ -650,7 +704,7 @@ with tab_greeks:
                 source = grp["Source"].iloc[0]
                 coverage = f"{grp['ExpiryDate'].min().strftime('%Y-%m')} to {grp['ExpiryDate'].max().strftime('%Y-%m')}"
                 dot = "🟢" if source == "market" else "🟡"
-                label = "LIVE market-calibrated" if source == "market" else "STATIC fallback"
+                label = {"market": "LIVE market-calibrated", "dummy": "DUMMY (simulated)"}.get(source, "STATIC fallback")
                 lines.append(f"{dot} {underlying}: {label} ({coverage})")
             st.caption("Vol surface — " + " · ".join(lines))
         else:
@@ -681,6 +735,15 @@ with tab_greeks:
                 "See 'VolStalenessDays' in the table below for the per-position detail."
             )
 
+        if not live_greeks.empty and live_greeks["VolExtrapolated"].any():
+            bad = live_greeks[live_greeks["VolExtrapolated"]]
+            st.warning(
+                f"{len(bad)} open position(s) sit outside the quoted vol surface (moneyness or tenor) -- "
+                "their vol is held flat at the nearest quoted point: "
+                + ", ".join(f"{r.UnderlyingContract} {r.OptionType} {r.Strike:g} (K/F={r.Moneyness:.2f})"
+                            for r in bad.itertuples())
+            )
+
         total_realized_opt = realized_opt_df["RealizedPnL"].sum() if not realized_opt_df.empty else 0.0
         total_position_delta_opt = live_greeks["PositionDelta"].sum() if not live_greeks.empty else 0.0
 
@@ -697,7 +760,7 @@ with tab_greeks:
             disp = live_greeks.copy()
             for col in ["Forward", "TheoPrice"]:
                 disp[col] = disp[col].round(2)
-            for col in ["ImpliedVol", "Delta", "Gamma", "Theta", "Rho"]:
+            for col in ["ImpliedVol", "Moneyness", "Delta", "Gamma", "Theta", "Rho"]:
                 disp[col] = disp[col].round(4)
             for col in ["Vega", "PositionDelta", "PositionGamma", "PositionVega",
                         "PositionTheta", "PositionRho", "PositionValue"]:
@@ -745,102 +808,83 @@ with tab_greeks:
 
         as_of = settles["Date"].max()
         F = last_settle_by_contract[sel_underlying]
-        try:
-            resolved_underlying = resolve_surface_underlying(vol_surface, sel_underlying)
-            expiry = vol_surface.loc[vol_surface["UnderlyingContract"] == resolved_underlying, "ExpiryDate"].iloc[0]
-            days_to_expiry = (expiry - as_of).days
-            vol_data_available = True
-        except (ValueError, IndexError) as e:
-            st.warning(f"No volatility surface data available for {sel_underlying}: {e}")
-            vol_data_available = False
-            days_to_expiry = 0
 
-        if not vol_data_available:
-            pass  # warning already shown above
-        elif days_to_expiry <= 0:
-            st.warning(f"{sel_underlying}'s option expiry has passed the latest settlement date — nothing to plot.")
+        # Expiry: use the REAL option expiry for this underlying from the
+        # options book (nearest one still alive). The old code took
+        # vol_surface[...]["ExpiryDate"].iloc[0] -- the surface's first
+        # synthetic tenor (as_of + 1M), unrelated to the contract -- so T
+        # in this chart did not match any option actually held.
+        live_expiries = sorted(
+            e for e in option_trades.loc[option_trades["UnderlyingContract"] == sel_underlying, "ExpiryDate"].unique()
+            if pd.Timestamp(e) > as_of
+        )
+        if live_expiries:
+            expiry = pd.Timestamp(colA.selectbox(
+                "Option expiry", live_expiries, format_func=lambda e: pd.Timestamp(e).strftime("%Y-%m-%d"),
+                key="greeks_expiry"))
         else:
-            # Resolve the real (Strike, ImpliedVol) slice ONCE -- not once
-            # per query strike -- and check it actually has enough distinct
-            # strikes to interpolate a smile from BEFORE sweeping across it.
-            # np.interp against a single point doesn't error; it silently
-            # returns that one constant for every query, which rendered as
-            # a flat "smile" with no warning anywhere -- a real bug this
-            # check exists specifically to catch.
-            day_slice, chart_staleness = get_vol_surface_slice(vol_surface, sel_underlying, expiry, as_of)
+            dte = colA.slider("No live option expiry in the book -- days to expiry", 7, 365, 60, key="greeks_dte")
+            expiry = as_of + pd.Timedelta(days=dte)
+        days_to_expiry = (expiry - as_of).days
 
-            if day_slice["Strike"].nunique() < 2:
-                st.warning(
-                    f"Only {day_slice['Strike'].nunique()} distinct strike(s) of real market data are "
-                    f"available for {sel_underlying} at the nearest matching expiry/date — not enough "
-                    "coverage to plot a smile. This happens when live market liquidity at this maturity "
-                    "was too thin to survive the no-extrapolation filtering in market_vol_surface.py."
-                )
-            else:
+        if days_to_expiry <= 0:
+            st.warning(f"{sel_underlying}'s option expiry has passed the latest settlement date -- nothing to plot.")
+        else:
+            T = days_to_expiry / 365.0
+            # Sweep in MONEYNESS around the Brent forward, then read vols
+            # by K/F. The surface's absolute Strike column is in BNO/USO
+            # ETF dollars (~$30 / ~$75), not Brent $/bbl -- matching on it
+            # is what produced the flat / clamped smile and empty charts.
+            strike_grid = np.linspace(0.80 * F, 1.20 * F, 81)
+            try:
+                sigmas, extrap, chart_staleness = smile_vols(vol_surface, sel_underlying, F, strike_grid, T, as_of)
+            except ValueError as e:
+                st.warning(f"No usable volatility surface for {sel_underlying}: {e}")
+                sigmas = None
+
+            if sigmas is not None:
                 if chart_staleness > VOL_SURFACE_STALENESS_WARNING_DAYS:
-                    st.warning(
-                        f"This chart's vol surface lookup is {chart_staleness} days from the selected as-of "
-                        "date — the smile shown may not reflect current conditions."
-                    )
+                    st.warning(f"Vol surface is {chart_staleness} days from the as-of date -- smile may be stale.")
+                if extrap.any():
+                    st.caption("Dotted segments: outside quoted moneyness/tenor coverage -- vol held flat at the "
+                               "nearest quoted point (shown for continuity, not market data).")
 
-                T = days_to_expiry / 365.0
+                greek_curves = {g: [] for g in ["Delta", "Gamma", "Vega", "Theta"]}
+                for k, sigma in zip(strike_grid, sigmas):
+                    g = black76_greeks(F, k, T, RISK_FREE_RATE_DEFAULT, float(sigma), sel_type)
+                    for name in greek_curves:
+                        greek_curves[name].append(g[name])
 
-                # Restrict the sweep to the INTERSECTION of the intended
-                # window (F*0.85-F*1.15) and the real data's actual strike
-                # range. Sweeping the full intended window regardless of
-                # real coverage was a second, more subtle form of the same
-                # bug already fixed once (single-point collapse): np.interp
-                # doesn't extrapolate a trend outside the real range, but it
-                # DOES clamp to the boundary value -- which, if the real
-                # range is much narrower than the intended window (thin
-                # liquidity, e.g. BNO), can make MOST of a wide sweep
-                # render as a flat clamped line even with several genuine
-                # real points feeding it. Clamping is extrapolation by
-                # another name, and this project doesn't do that anywhere
-                # else -- the chart shouldn't either.
-                intended_min, intended_max = F * 0.85, F * 1.15
-                real_min, real_max = day_slice["Strike"].min(), day_slice["Strike"].max()
-                plot_min, plot_max = max(intended_min, real_min), min(intended_max, real_max)
+                def _split(y):
+                    """Two traces: solid where quoted, dotted where extrapolated."""
+                    y = np.asarray(y, dtype=float)
+                    return np.where(~extrap, y, np.nan), np.where(extrap, y, np.nan)
 
-                if plot_min >= plot_max:
-                    st.warning(
-                        f"Real market strike coverage for {sel_underlying} ({real_min:.2f}-{real_max:.2f}) "
-                        f"doesn't overlap the intended ±15% window around the forward ({intended_min:.2f}-"
-                        f"{intended_max:.2f}) — nothing to plot without extrapolating beyond real data."
-                    )
-                else:
-                    if plot_min > intended_min or plot_max < intended_max:
-                        st.caption(
-                            f"Chart restricted to {plot_min:.2f}-{plot_max:.2f} — the real market strike "
-                            f"coverage available ({real_min:.2f}-{real_max:.2f}) is narrower than the full "
-                            f"±15% window; no extrapolation is shown beyond what's actually quoted."
-                        )
-                    strike_grid = np.linspace(plot_min, plot_max, 60)
-                    sigmas = np.interp(strike_grid, day_slice["Strike"].values, day_slice["ImpliedVol"].values)
+                smile_fig = go.Figure()
+                solid, dotted = _split(sigmas * 100)
+                smile_fig.add_trace(go.Scatter(x=strike_grid, y=solid, mode="lines", name="Implied vol (quoted)"))
+                smile_fig.add_trace(go.Scatter(x=strike_grid, y=dotted, mode="lines", name="held flat",
+                                               line=dict(dash="dot")))
+                smile_fig.add_vline(x=F, line_dash="dot", line_color=COLOR["accent"],
+                                    annotation_text=f"F={F:.2f}", annotation_position="top")
+                smile_fig.update_layout(xaxis_title="Strike ($/bbl)", yaxis_title="Implied vol (%)", height=280,
+                                        title=f"{sel_underlying} smile -- {days_to_expiry}d to {expiry:%Y-%m-%d}")
+                apply_terminal_theme(smile_fig)
+                st.plotly_chart(smile_fig, width="stretch")
 
-                    greek_curves = {g: [] for g in ["Delta", "Gamma", "Vega", "Theta"]}
-                    for k, sigma in zip(strike_grid, sigmas):
-                        g = black76_greeks(F, k, T, RISK_FREE_RATE_DEFAULT, sigma, sel_type)
-                        for name in greek_curves:
-                            greek_curves[name].append(g[name])
-
-                    smile_fig = go.Figure()
-                    smile_fig.add_trace(go.Scatter(x=strike_grid, y=sigmas, mode="lines", name="Implied Vol"))
-                    smile_fig.add_vline(x=F, line_dash="dot", line_color=COLOR["accent"],
-                                         annotation_text="Forward", annotation_position="top")
-                    smile_fig.update_layout(xaxis_title="Strike", yaxis_title="Implied Vol", height=260)
-                    apply_terminal_theme(smile_fig)
-                    st.plotly_chart(smile_fig, width="stretch")
-
-                    grid_fig = make_subplots(rows=2, cols=2, subplot_titles=["Delta", "Gamma", "Vega", "Theta"])
-                    positions_rc = [(1, 1), (1, 2), (2, 1), (2, 2)]
-                    for (name, values), (r, c) in zip(greek_curves.items(), positions_rc):
-                        grid_fig.add_trace(go.Scatter(x=strike_grid, y=values, mode="lines", name=name, showlegend=False),
-                                            row=r, col=c)
-                        grid_fig.add_vline(x=F, line_dash="dot", line_color=COLOR["accent"], row=r, col=c)
-                    grid_fig.update_layout(height=520)
-                    apply_terminal_theme(grid_fig)
-                    st.plotly_chart(grid_fig, width="stretch")
+                units = {"Delta": "per $1 in F", "Gamma": "per $1 in F", "Vega": "$ per vol pt", "Theta": "$ per day"}
+                grid_fig = make_subplots(rows=2, cols=2,
+                                         subplot_titles=[f"{n} ({u}, per bbl)" for n, u in units.items()])
+                for (name, values), (r, c) in zip(greek_curves.items(), [(1, 1), (1, 2), (2, 1), (2, 2)]):
+                    solid, dotted = _split(values)
+                    grid_fig.add_trace(go.Scatter(x=strike_grid, y=solid, mode="lines", showlegend=False,
+                                                  line=dict(color=COLOR["accent"])), row=r, col=c)
+                    grid_fig.add_trace(go.Scatter(x=strike_grid, y=dotted, mode="lines", showlegend=False,
+                                                  line=dict(color=COLOR["accent"], dash="dot")), row=r, col=c)
+                    grid_fig.add_vline(x=F, line_dash="dot", line_color=COLOR["text_secondary"], row=r, col=c)
+                grid_fig.update_layout(height=540)
+                apply_terminal_theme(grid_fig)
+                st.plotly_chart(grid_fig, width="stretch")
 
 # ==========================================================================
 # TAB 4 — Market Data: benchmark prices (Brent/WTI/TTF) and the implied
@@ -853,8 +897,13 @@ with tab_market:
     )
     lookback_days = {"6 months": 182, "1 year": 365, "2 years": 730}[lookback_choice]
 
-    prices, price_source = get_benchmark_prices(lookback_days)
-    if price_source != "live" or prices.empty:
+    if DATA_MODE == "dummy":
+        prices, price_source = pd.DataFrame(), "dummy"
+    else:
+        prices, price_source = get_benchmark_prices(lookback_days)
+    if price_source == "dummy":
+        st.info("Benchmark prices (live Yahoo data) are switched off in dummy mode.")
+    elif price_source != "live" or prices.empty:
         st.warning(
             "Live benchmark price data is currently unavailable (network or Yahoo Finance fetch failed). "
             "There's no offline fallback for WTI/TTF yet — settlement_prices.csv only ever covered the "
@@ -892,14 +941,21 @@ with tab_market:
         )
 
     st.subheader("Implied Volatility Surface")
-    st.caption(
-        "Same live, market-calibrated surface used by the Greeks tab (BNO/USO listed options, "
-        "Black-76 implied vol, no extrapolation) — see the Greeks tab for per-commodity source "
-        "and coverage details."
-    )
+    if DATA_MODE == "dummy":
+        st.caption("Dummy surface (volatility_surface_dummy.csv), as of the selected date -- the same one the Greeks tab uses.")
+    else:
+        st.caption(
+            "Same live, market-calibrated surface used by the Greeks tab (BNO/USO listed options, "
+            "Black-76 implied vol, no extrapolation) — see the Greeks tab for per-commodity source "
+            "and coverage details."
+        )
 
     try:
-        vol_surface_for_plot = get_market_vol_surface()
+        vol_surface_for_plot = (get_options_data()[1] if DATA_MODE == "dummy" else get_market_vol_surface())
+        # Show the surface as of the selected date (dummy has one per day).
+        if "Date" in vol_surface_for_plot.columns and vol_surface_for_plot["Date"].nunique() > 1:
+            _d = min(vol_surface_for_plot["Date"].unique(), key=lambda d: abs((pd.Timestamp(d) - as_of_date).days))
+            vol_surface_for_plot = vol_surface_for_plot[vol_surface_for_plot["Date"] == _d]
     except Exception as e:
         vol_surface_for_plot = pd.DataFrame()
         st.error(f"Could not load volatility surface data: {e}")
