@@ -37,6 +37,7 @@ from pnl_engine import (
     compute_fifo_positions,
     open_position_summary,
 )
+from market_data import get_settlement_prices
 from market_vol_surface import build_market_vol_surface
 from risk_engine import (
     build_risk_inputs_from_book,
@@ -61,13 +62,19 @@ from greeks_engine import (
 st.set_page_config(page_title="Brent Futures Book — PnL & Risk", layout="wide")
 
 # ==========================================================================
-# DATA SOURCES
-#   Portfolio / Risk / Greeks tabs -> the *_dummy files written by
-#     generate_dummy_data.py (one consistent simulated world, used to check
-#     the maths -- see test_math.py).
-#   Market Data tab -> live Yahoo Finance (benchmark prices + BNO/USO
-#     market-calibrated vol surface), as before.
+# DATA SOURCES -- chosen with the "Data mode" switch at the top of the sidebar
+#
+#   Dummy      Portfolio / Risk / Greeks tabs read the *_dummy files written
+#              by generate_dummy_data.py (one consistent simulated world, used
+#              to check the maths -- see test_math.py).
+#   Production Portfolio / Risk tabs read trades.xlsx + Yahoo settlements
+#              (BZ=F, CSV fallback); Greeks tab reads options_trades.xlsx +
+#              the BNO/USO market-calibrated vol surface.
+#
+#   Market Data tab -> ALWAYS live Yahoo Finance (benchmark prices + BNO/USO
+#   market vol surface), whichever mode is selected.
 # ==========================================================================
+DATA_MODES = {"Dummy — math check": "dummy", "Production — Yahoo Finance": "production"}
 DUMMY_FILES = {
     "trades": "trades_dummy.xlsx",
     "options": "options_trades_dummy.xlsx",
@@ -293,11 +300,24 @@ def style_risk_table(df: pd.DataFrame, magnitude_cols: list) -> "pd.io.formats.s
 # output -- re-running that script regenerates the _dummy files only and
 # will never touch your real trades.xlsx / options_trades.xlsx. See
 # README.md for the full workflow.
-@st.cache_data(ttl=900)
-def get_data():
-    trades = load_trades(DUMMY_FILES["trades"])
-    settles = load_settlement_prices(DUMMY_FILES["settles"])
-    settles["Source"] = "dummy"
+@st.cache_data(ttl=900)  # cached separately per mode (mode is an argument)
+def get_data(mode: str):
+    if mode == "dummy":
+        trades = load_trades(DUMMY_FILES["trades"])
+        settles = load_settlement_prices(DUMMY_FILES["settles"])
+        settles["Source"] = "dummy"
+        return trades, settles
+
+    # Production: real blotter + Yahoo settlements. All contracts currently
+    # map to the same Yahoo front-month proxy ticker -- see the limitation
+    # explained at the top of market_data.py. Falls back to
+    # settlement_prices.csv (labelled) if the live fetch fails.
+    trades = load_trades("trades.xlsx")
+    contracts = sorted(trades["Contract"].unique())
+    contract_ticker_map = {c: "BZ=F" for c in contracts}
+    settles = get_settlement_prices(
+        contract_ticker_map, start_date=trades["TradeDate"].min(), csv_fallback_path="settlement_prices.csv"
+    )
     return trades, settles
 
 
@@ -366,15 +386,31 @@ def get_market_vol_surface():
     return pd.concat(surfaces, ignore_index=True)
 
 
-@st.cache_data(ttl=900)
-def get_options_data():
-    option_trades = load_option_trades(DUMMY_FILES["options"])
-    vol_surface = load_volatility_surface(DUMMY_FILES["vol_surface"])
-    vol_surface["Source"] = "dummy"
+@st.cache_data(ttl=900)  # cached separately per mode
+def get_options_data(mode: str):
+    if mode == "dummy":
+        option_trades = load_option_trades(DUMMY_FILES["options"])
+        vol_surface = load_volatility_surface(DUMMY_FILES["vol_surface"])
+        vol_surface["Source"] = "dummy"
+        return option_trades, vol_surface
+    option_trades = load_option_trades("options_trades.xlsx")
+    vol_surface = get_market_vol_surface()   # raises RuntimeError if Yahoo fails -- shown in the Greeks tab
     return option_trades, vol_surface
 
 
-trades_all, settles_all = get_data()
+st.sidebar.markdown('<div class="term-panel-title">Data mode</div>', unsafe_allow_html=True)
+_mode_label = st.sidebar.radio(
+    "Data mode", list(DATA_MODES), index=0, key="data_mode", label_visibility="collapsed",
+    help="Dummy: simulated files, for checking the maths. Production: your real blotters with live Yahoo prices "
+         "and the BNO/USO market vol surface. The Market Data tab is always live Yahoo data.",
+)
+DATA_MODE = DATA_MODES[_mode_label]
+
+try:
+    trades_all, settles_all = get_data(DATA_MODE)
+except Exception as e:
+    st.error(f"Could not load {DATA_MODE} trades / settlement prices: {e}")
+    st.stop()
 
 # --------------------------------------------------------------------------
 # As Of Date — lets the user view the book's state at any date between the
@@ -389,6 +425,7 @@ max_as_of = settles_all["Date"].max().date()
 st.sidebar.markdown('<div class="term-panel-title">As of date</div>', unsafe_allow_html=True)
 as_of_selected = st.sidebar.date_input(
     "Portfolio state as of", value=max_as_of, min_value=min_as_of, max_value=max_as_of,
+    key=f"as_of_{DATA_MODE}",
 )
 as_of_date = pd.Timestamp(as_of_selected)
 is_latest = as_of_date.date() == max_as_of
@@ -449,10 +486,17 @@ st.markdown(
 
 st.title("Brent Crude Futures — Book PnL & Risk")
 
-st.warning(
-    "DUMMY DATA on the Portfolio, Risk and Greeks tabs — math check only (simulated files from "
-    "generate_dummy_data.py). The Market Data tab shows live Yahoo Finance data."
-)
+if DATA_MODE == "dummy":
+    st.warning(
+        "DUMMY DATA on the Portfolio, Risk and Greeks tabs — math check only (simulated files from "
+        "generate_dummy_data.py). The Market Data tab shows live Yahoo Finance data. "
+        "Switch to Production in the sidebar for your real blotters."
+    )
+else:
+    st.info(
+        "PRODUCTION — trades.xlsx / options_trades.xlsx priced with Yahoo Finance data (BZ=F settlements, "
+        "BNO/USO vol surface). See the status bar above for whether live prices or the CSV fallback are in use."
+    )
 
 # --------------------------------------------------------------------------
 # Sidebar: watchlist + live price override
@@ -480,20 +524,25 @@ for c in contracts:
 st.sidebar.markdown('<div class="term-panel-title">Manual price override</div>', unsafe_allow_html=True)
 st.sidebar.caption("Feeds Live PnL on the Portfolio Analysis tab. Swap for a real feed in production.")
 
-if "live_prices" not in st.session_state:
-    st.session_state.live_prices = dict(last_settle_by_contract)
+# Live-price overrides are kept per mode, so switching modes never carries
+# dummy prices into production (or the reverse).
+_lp_key = f"live_prices_{DATA_MODE}"
+if _lp_key not in st.session_state:
+    st.session_state[_lp_key] = dict(last_settle_by_contract)
 
 if st.sidebar.button("Simulate a live tick"):
+    st.session_state["_tick"] = st.session_state.get("_tick", 0) + 1
     for c in contracts:
         base = last_settle_by_contract[c]
-        st.session_state.live_prices[c] = round(base + np.random.normal(0, 0.35), 2)
+        st.session_state[_lp_key][c] = round(base + np.random.normal(0, 0.35), 2)
 
 live_prices = {}
 for c in contracts:
     live_prices[c] = st.sidebar.number_input(
-        c, value=float(st.session_state.live_prices.get(c, last_settle_by_contract[c])), step=0.01, format="%.2f"
+        c, value=float(st.session_state[_lp_key].get(c, last_settle_by_contract[c])), step=0.01, format="%.2f",
+        key=f"px_{DATA_MODE}_{c}_{st.session_state.get('_tick', 0)}",
     )
-st.session_state.live_prices = live_prices
+st.session_state[_lp_key] = live_prices
 
 st.sidebar.button("Refresh live PnL", type="primary")
 
@@ -639,7 +688,12 @@ with tab_risk:
         with st.expander("Correlation matrix (return series, current lookback)"):
             corr = returns.corr()
             st.dataframe(corr.round(2), width="stretch")
-            # (dummy contracts share one simulated price factor, so high correlation is expected)
+            if DATA_MODE == "production" and corr.where(~np.eye(len(corr), dtype=bool)).max().max() > 0.95:
+                st.info(
+                    "Contracts are highly correlated because they're currently all priced off "
+                    "the same broadcast ticker (see market_data.py). Parametric VaR won't show "
+                    "much diversification benefit until each contract has an independent price series."
+                )
     elif returns is not None:
         st.error("Not enough overlapping historical data to compute VaR/ES yet.")
 
@@ -656,7 +710,7 @@ with tab_greeks:
     )
 
     try:
-        option_trades_all, vol_surface = get_options_data()
+        option_trades_all, vol_surface = get_options_data(DATA_MODE)
         option_trades = option_trades_all[option_trades_all["TradeDate"] <= as_of_date].reset_index(drop=True)
     except FileNotFoundError as e:
         st.error(f"Options data not found: {e}")
@@ -774,7 +828,7 @@ with tab_greeks:
         )
 
         colA, colB = st.columns(2)
-        sel_underlying = colA.selectbox("Underlying", contracts, key="greeks_underlying")
+        sel_underlying = colA.selectbox("Underlying", contracts, key=f"greeks_underlying_{DATA_MODE}")
         sel_type = colB.radio("Option type", ["CALL", "PUT"], horizontal=True, key="greeks_option_type")
 
         as_of = settles["Date"].max()
@@ -792,7 +846,7 @@ with tab_greeks:
         if live_expiries:
             expiry = pd.Timestamp(colA.selectbox(
                 "Option expiry", live_expiries, format_func=lambda e: pd.Timestamp(e).strftime("%Y-%m-%d"),
-                key="greeks_expiry"))
+                key=f"greeks_expiry_{DATA_MODE}_{sel_underlying}"))
         else:
             dte = colA.slider("No live option expiry in the book -- days to expiry", 7, 365, 60, key="greeks_dte")
             expiry = as_of + pd.Timedelta(days=dte)
