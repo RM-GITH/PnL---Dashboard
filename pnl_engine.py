@@ -348,7 +348,7 @@ def book_summary(trades: pd.DataFrame, settles: pd.DataFrame,
 # ==========================================================================
 if __name__ == "__main__":
     trades = load_trades("trades_dummy.xlsx")
-    settles = load_settlement_prices("settlement_prices.csv")
+    settles = load_settlement_prices("settlement_prices_dummy.csv")
 
     open_lots, realized_df = compute_fifo_positions(trades)
     total_realized = realized_df["RealizedPnL"].sum()
@@ -374,7 +374,7 @@ if __name__ == "__main__":
 
     print("\nBook summary:")
     print(book_summary(trades, settles, live_prices={
-        "BRN Sep26": 84.20, "BRN Oct26": 83.10, "BRN Dec26": 81.75
+        "BRN Oct26": 69.50, "BRN Nov26": 69.00, "BRN Dec26": 68.40
     }).to_string(index=False))
 
     # Sanity check: if the "live" price you feed in equals the last settle
